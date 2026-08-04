@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Fotoman</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+  <link rel="icon" href="/favicon.ico" sizes="any" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,600;0,9..40,700;1,9..40,400&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="anonymous" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="top">
+    <div class="brand">Fotoman</div>
+    <nav>
+      <button class="tab active" data-tab="sources">Archive</button>
+      <button class="tab" data-tab="browse">Browse</button>
+      <button class="tab" data-tab="map">Map</button>
+      <button class="tab" data-tab="search">Search</button>
+      <button class="tab" data-tab="dupes">Bundle</button>
+    </nav>
+    <div id="stats" class="stats"></div>
+  </header>
+
+  <main>
+    <section id="tab-search" class="panel">
+      <form id="search-form" class="search-bar">
+        <input id="q" type="search" placeholder="Describe a photo… e.g. red canoe on a lake at sunset" />
+        <select id="mode">
+          <option value="visual">Visual (SigLIP)</option>
+          <option value="hybrid">Visual + filters</option>
+          <option value="meta">Metadata only</option>
+        </select>
+        <button type="submit">Search</button>
+      </form>
+      <details class="filters">
+        <summary>Filters</summary>
+        <div class="filter-grid">
+          <label class="place-field">Places
+            <div class="autocomplete">
+              <input id="place" type="search" placeholder="City, region, or country…" autocomplete="off" />
+              <ul id="place-suggest" class="suggest" hidden></ul>
+            </div>
+          </label>
+          <label>Album <input id="album" placeholder="Nepal" /></label>
+          <label>Camera <input id="camera" placeholder="iPhone" /></label>
+          <label>From <input id="taken_from" type="date" /></label>
+          <label>To <input id="taken_to" type="date" /></label>
+          <label class="check"><input id="has_gps" type="checkbox" /> Has GPS</label>
+          <label class="check"><input id="show_remove" type="checkbox" /> Show remove bin</label>
+        </div>
+      </details>
+      <div class="selection-toolbar">
+        <button type="button" id="btn-search-select-all" class="browse-select-all" hidden>Select all</button>
+        <button type="button" id="btn-search-remove" class="danger" disabled>Remove selected</button>
+        <button type="button" id="btn-search-restore" disabled>Restore selected</button>
+        <span id="search-selection-count" class="muted browse-selection-count"></span>
+      </div>
+      <div id="results" class="grid"></div>
+    </section>
+
+    <section id="tab-browse" class="panel">
+      <div class="browse-layout">
+        <aside class="browse-sidebar">
+          <div class="browse-views">
+            <button class="browse-btn active" data-view="folders">Archives</button>
+            <button class="browse-btn" data-view="date">Date</button>
+            <button class="browse-btn" data-view="camera">Camera</button>
+            <button class="browse-btn" data-view="location">Places</button>
+            <button class="browse-btn" data-view="people">People</button>
+            <button class="browse-btn" data-view="bundles">Bundles</button>
+            <button class="browse-btn" data-view="remove">Remove bin</button>
+          </div>
+          <label class="browse-opt check" id="browse-files-opt" hidden>
+            <input type="checkbox" id="browse-show-files" /> Show files in sub-folders
+          </label>
+          <label class="browse-opt check" id="browse-remove-opt">
+            <input type="checkbox" id="browse-show-remove" /> Show remove bin
+          </label>
+          <div id="browse-groups" class="browse-groups"></div>
+        </aside>
+        <div class="browse-gallery">
+          <div class="browse-gallery-toolbar">
+            <div class="browse-view-modes" role="group" aria-label="Gallery view">
+              <button type="button" class="browse-view-btn active" data-gallery-view="thumbs" title="Cards">Cards</button>
+              <button type="button" class="browse-view-btn" data-gallery-view="cards" title="Thumbnails">Thumbnails</button>
+              <button type="button" class="browse-view-btn" data-gallery-view="details" title="Details">Details</button>
+            </div>
+            <label class="browse-opt check" id="browse-frame-opt" hidden>
+              <input type="checkbox" id="browse-show-frame" checked /> Frame
+            </label>
+            <div class="browse-selection-actions">
+              <button type="button" id="btn-browse-select-all" class="browse-select-all" hidden>Select all</button>
+              <button type="button" id="btn-browse-edit" disabled>Edit properties</button>
+              <button type="button" id="btn-browse-remove" class="danger" disabled>Remove selected</button>
+              <button type="button" id="btn-browse-restore" disabled>Restore selected</button>
+              <span id="browse-selection-count" class="muted browse-selection-count"></span>
+            </div>
+          </div>
+          <div id="browse-results" class="grid"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-map" class="panel">
+      <div class="map-toolbar">
+        <span id="map-status" class="muted">Loading map…</span>
+        <label class="check"><input id="map-show-remove" type="checkbox" /> Show remove bin</label>
+      </div>
+      <div id="photo-map" class="photo-map" role="application" aria-label="Photo map"></div>
+    </section>
+
+    <section id="tab-sources" class="panel active">
+      <div class="source-form">
+        <button type="button" id="btn-add-source">Add archive</button>
+      </div>
+      <div class="index-bar">
+        <ol class="index-stages" id="index-stages" aria-label="Processing stages"></ol>
+        <p id="index-status" class="muted"></p>
+      </div>
+      <ul id="source-list" class="source-list"></ul>
+    </section>
+
+    <section id="tab-dupes" class="panel">
+      <div class="dupe-actions">
+        <label class="dupe-check"><input type="checkbox" id="find-exact" checked /> Duplicate</label>
+        <label class="dupe-check" title="Same photo resized or saved as a different file type"><input type="checkbox" id="find-formatted" /> Formatted</label>
+        <label class="dupe-check" title="Near-duplicate variation; 0 disables near matching">Variation
+          <input id="variation" type="range" min="0" max="5" step="1" value="3" />
+        </label>
+        <button id="btn-rebuild">Find bundles</button>
+        <button type="button" id="btn-dupe-select-toggle" hidden>Select non-primary</button>
+        <button id="btn-remove-selected" class="danger" disabled>Remove selected</button>
+        <button id="btn-restore-selected" disabled>Restore selected</button>
+        <label class="dupe-check"><input type="checkbox" id="dupe-include-removed" /> Include removed</label>
+      </div>
+      <p class="muted">Click to select, double-click to open. Primary is auto-picked by resolution. Removed photos only show when Include removed is on.</p>
+      <div id="dupe-list"></div>
+    </section>
+  </main>
+
+  <dialog id="lightbox">
+    <div class="lightbox-body">
+      <button type="button" id="lightbox-prev" class="lightbox-nav lightbox-prev" aria-label="Previous" hidden>&#9664;</button>
+      <div class="lightbox-stage">
+        <img id="lightbox-img" alt="" />
+        <div id="lightbox-faces" class="lightbox-faces" hidden></div>
+      </div>
+      <button type="button" id="lightbox-next" class="lightbox-nav lightbox-next" aria-label="Next" hidden>&#9654;</button>
+      <aside id="lightbox-info" class="lightbox-info" hidden>
+        <dl id="lightbox-meta" class="lightbox-meta"></dl>
+        <label class="check lightbox-frames-opt" id="lightbox-frames-opt" hidden>
+          <input type="checkbox" id="lightbox-show-frames" /> Frames
+        </label>
+        <ul id="lightbox-face-list" class="lightbox-face-list" hidden></ul>
+      </aside>
+    </div>
+    <form method="dialog"><button>Close</button></form>
+  </dialog>
+
+  <dialog id="edit-properties" class="props-dialog">
+    <form id="edit-properties-form">
+      <h2>Edit properties</h2>
+      <p id="edit-properties-count" class="muted"></p>
+      <div class="prop-fields">
+        <label class="prop-field">Date taken
+          <input type="datetime-local" name="taken_at" id="edit-prop-taken-at" step="1" />
+        </label>
+        <label class="prop-field">Place
+          <input type="text" name="place_label" id="edit-prop-place" placeholder="City, [State,] Country" autocomplete="off" />
+        </label>
+        <label class="prop-field">Orientation
+          <select name="orientation" id="edit-prop-orientation">
+            <option value="">— leave unchanged —</option>
+            <option value="0">0°</option>
+            <option value="90">90° CW</option>
+            <option value="180">180°</option>
+            <option value="270">270° CW</option>
+          </select>
+        </label>
+      </div>
+      <p id="edit-properties-error" class="error" hidden></p>
+      <div class="dialog-actions">
+        <button type="button" id="btn-edit-properties-cancel">Cancel</button>
+        <button type="submit" id="btn-edit-properties-save">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

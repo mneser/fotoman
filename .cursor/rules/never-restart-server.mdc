@@ -1,0 +1,11 @@
+---
+description: Never start or restart the fotoman server; user handles restarts
+alwaysApply: true
+---
+
+# Do not restart the server
+
+- **Never** start, restart, or relaunch the fotoman / uvicorn / `run.py` server.
+- **Never** run `python run.py`, `uvicorn`, or equivalent to bring the app back up after stopping it.
+- You may **stop** the server (kill the process) when the user asks.
+- The user always restarts the server themselves.
