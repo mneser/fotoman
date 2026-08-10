@@ -10,9 +10,13 @@ from typing import Any
 
 _lock = threading.Lock()
 _subscribers: list[queue.Queue] = []
+_SHUTDOWN = object()
+_closing = threading.Event()
 
 # Keep UI snappy on per-image ticks without flooding the browser.
 _THROTTLE_S = 0.1
+_KEEPALIVE_S = 30.0
+_POLL_S = 1.0
 _last_push: dict[str, float] = {}
 
 
@@ -48,17 +52,38 @@ def unsubscribe(q: queue.Queue) -> None:
             pass
 
 
+def close_all() -> None:
+    """Wake every SSE subscriber so streams end (needed for clean Ctrl+C shutdown)."""
+    _closing.set()
+    with _lock:
+        subs = list(_subscribers)
+        _subscribers.clear()
+    for q in subs:
+        try:
+            q.put_nowait(_SHUTDOWN)
+        except queue.Full:
+            pass
+
+
 async def iter_events(q: queue.Queue):
     """Async generator that yields SSE lines from a thread-safe queue."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
+    last_ka = time.monotonic()
     try:
-        while True:
+        while not _closing.is_set():
             try:
-                payload = await asyncio.wait_for(
-                    loop.run_in_executor(None, q.get, True, 30), timeout=35
+                payload = await loop.run_in_executor(
+                    None, lambda: q.get(True, _POLL_S)
                 )
-                yield f"data: {payload}\n\n"
-            except (asyncio.TimeoutError, Exception):
-                yield ": keepalive\n\n"
+            except queue.Empty:
+                if _closing.is_set():
+                    return
+                if time.monotonic() - last_ka >= _KEEPALIVE_S:
+                    yield ": keepalive\n\n"
+                    last_ka = time.monotonic()
+                continue
+            if payload is _SHUTDOWN or _closing.is_set():
+                return
+            yield f"data: {payload}\n\n"
     except asyncio.CancelledError:
         return

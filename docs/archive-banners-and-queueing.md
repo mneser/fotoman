@@ -13,7 +13,7 @@ Embed and Faces toggles fire the POST, save the returned status, and call `loadS
 
 Always shown in the progress header, in order:
 - **Indexing / Geocoding / Fingerprinting**: live `total - current` while that phase is running
-- **Face-scan**: sum of `pending_faces_count` across sources with `face_enabled=1` (always visible; before Embedding)
+- **Facematch**: sum of `pending_faces_count` across sources with `face_enabled=1` (always visible; before Embedding)
 - **Embedding**: sum of `pending_embed_count` across sources with `embed_enabled=1`
 
 Zero remaining → count hidden. The archive row currently being processed gets an `is-active` highlight.

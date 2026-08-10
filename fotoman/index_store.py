@@ -68,6 +68,14 @@ class IndexStore:
             out.append((self.ids[idx], float(score)))
         return out
 
+    def vector_for(self, content_id: int) -> np.ndarray | None:
+        """Return the stored embedding for a content id, or None if missing."""
+        try:
+            pos = self.ids.index(int(content_id))
+        except ValueError:
+            return None
+        return self.index.reconstruct(pos).astype(np.float32)
+
     def all_vectors(self) -> tuple[list[int], np.ndarray]:
         if self.index.ntotal == 0:
             return [], np.zeros((0, self.dim), dtype=np.float32)

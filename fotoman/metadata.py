@@ -1,14 +1,78 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import cv2
+import numpy as np
 from PIL import ExifTags, Image, ImageOps
 
 TAG_MAP = {v: k for k, v in ExifTags.TAGS.items()}
 GPS_MAP = {v: k for k, v in ExifTags.GPSTAGS.items()}
+
+# Thumb-sized assessment keeps scores comparable across originals.
+_QUALITY_MAX_SIDE = 384
+
+# Provenance for photo_contents.taken_at (higher rank wins; manual is sticky).
+TAKEN_AT_SOURCE_RANK = {
+    "mtime": 10,
+    "folder": 20,
+    "filename": 30,
+    "exif": 40,
+    "manual": 100,
+}
+
+# 20yy[-_.]mm[-_.]dd with optional time; or compact 20yymmdd[HHMMSS].
+_DATE_SEP = re.compile(
+    r"(?<!\d)(20\d{2}|19\d{2})[-_.](\d{2})[-_.](\d{2})"
+    r"(?:[ T_-](\d{2})[:.\-_]?(\d{2})(?:[:.\-_]?(\d{2}))?)?(?!\d)"
+)
+_DATE_COMPACT = re.compile(
+    r"(?<!\d)(20\d{2}|19\d{2})(\d{2})(\d{2})"
+    r"(?:[_-]?(\d{2})(\d{2})(\d{2}))?(?!\d)"
+)
+
+
+def assess_image_quality(im: Image.Image) -> dict[str, float]:
+    """Sharpness + exposure → combined quality for relative keeper ranking.
+
+    Scores are for comparing near-duplicates / bursts, not absolute aesthetics.
+    """
+    rgb = im if im.mode == "RGB" else im.convert("RGB")
+    arr = np.asarray(rgb)
+    if arr.size == 0:
+        return {"sharpness": 0.0, "exposure": 0.0, "quality": 0.0}
+
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    sharpness = float(np.log1p(lap_var))
+
+    g = gray.astype(np.float32) / 255.0
+    mean = float(g.mean())
+    dark = float((g < 0.05).mean())
+    bright = float((g > 0.95).mean())
+    clip = dark + bright
+    centered = 1.0 - min(1.0, abs(mean - 0.5) * 2.0)
+    exposure = float(max(0.0, min(1.0, centered * (1.0 - min(1.0, clip * 1.5)))))
+
+    quality = float(sharpness * (0.35 + 0.65 * exposure))
+    return {"sharpness": sharpness, "exposure": exposure, "quality": quality}
+
+
+def assess_quality_file(path: Path, *, max_side: int = _QUALITY_MAX_SIDE) -> dict[str, float] | None:
+    """Score an image or thumb file; returns None on failure."""
+    try:
+        with Image.open(path) as im:
+            im = ImageOps.exif_transpose(im).convert("RGB")
+            if max(im.size) > max_side:
+                im.thumbnail((max_side, max_side))
+            return assess_image_quality(im)
+    except Exception:
+        return None
 
 
 def file_sha1(path: Path, blocksize: int = 1 << 20) -> str:
@@ -36,6 +100,110 @@ def normalize_taken_at(value: str) -> str:
         except ValueError:
             continue
     raise ValueError(f"Invalid taken_at: {value!r}")
+
+
+def _ymd_hms_to_taken_at(
+    y: str, mo: str, d: str, hh: str | None = None, mm: str | None = None, ss: str | None = None
+) -> str | None:
+    try:
+        dt = datetime(
+            int(y),
+            int(mo),
+            int(d),
+            int(hh) if hh is not None else 0,
+            int(mm) if mm is not None else 0,
+            int(ss) if ss is not None else 0,
+        )
+    except ValueError:
+        return None
+    if dt.year < 1900 or dt.year > 2100:
+        return None
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def parse_date_from_text(text: str) -> str | None:
+    """First plausible ``20yy[-]mm[-]dd`` (optional time) in a name segment."""
+    if not text:
+        return None
+    for pat in (_DATE_SEP, _DATE_COMPACT):
+        m = pat.search(text)
+        if not m:
+            continue
+        g = m.groups()
+        taken = _ymd_hms_to_taken_at(g[0], g[1], g[2], g[3], g[4], g[5])
+        if taken:
+            return taken
+    return None
+
+
+def parse_date_from_path(path: Path) -> tuple[str | None, str | None]:
+    """Date from filename stem, else parent folder names. Returns ``(taken_at, source)``."""
+    stem = path.stem
+    taken = parse_date_from_text(stem)
+    if taken:
+        return taken, "filename"
+    # Walk parents nearest-first; skip filesystem roots / empty.
+    for part in reversed(path.parts[:-1]):
+        if not part or part in ("/", ".") or (len(part) == 2 and part[1] == ":"):
+            continue
+        taken = parse_date_from_text(part)
+        if taken:
+            return taken, "folder"
+    return None, None
+
+
+def resolve_taken_at(
+    path: Path,
+    *,
+    exif_taken_at: str | None = None,
+    mtime: float | None = None,
+    allow_mtime: bool = True,
+) -> tuple[str | None, str | None]:
+    """Pick capture date: EXIF → filename → folder → mtime.
+
+    Returns ``(taken_at, source)`` with source in
+    ``exif`` / ``filename`` / ``folder`` / ``mtime``, or ``(None, None)``.
+    """
+    if exif_taken_at:
+        try:
+            return normalize_taken_at(str(exif_taken_at)), "exif"
+        except ValueError:
+            pass
+    taken, source = parse_date_from_path(path)
+    if taken:
+        return taken, source
+    if not allow_mtime:
+        return None, None
+    if mtime is None:
+        try:
+            mtime = float(path.stat().st_mtime)
+        except OSError:
+            return None, None
+    try:
+        return datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S"), "mtime"
+    except (OSError, OverflowError, ValueError):
+        return None, None
+
+
+def can_replace_taken_at(
+    existing_taken: str | None,
+    existing_source: str | None,
+    new_taken: str | None,
+    new_source: str | None,
+) -> bool:
+    """True when ``new_*`` should overwrite DB date (manual / legacy stick)."""
+    if not new_taken or not new_source:
+        return False
+    if not existing_taken:
+        return True
+    if (existing_source or "") == "manual":
+        return False
+    if not existing_source:
+        # Legacy rows (pre-provenance): keep existing date.
+        return False
+    return TAKEN_AT_SOURCE_RANK.get(new_source, 0) > TAKEN_AT_SOURCE_RANK.get(
+        existing_source, 0
+    )
 
 
 def taken_at_to_exif(value: str) -> str:
@@ -66,6 +234,17 @@ def write_taken_at(path: Path, taken_at: str) -> None:
     piexif.insert(piexif.dump(exif_dict), str(path))
 
 
+def write_taken_at_mtime(path: Path, taken_at: str) -> float:
+    """Set filesystem atime/mtime to ``taken_at``. Does not change file bytes/hash.
+
+    Returns the unix mtime written.
+    """
+    dt = datetime.strptime(normalize_taken_at(taken_at), "%Y-%m-%d %H:%M:%S")
+    ts = dt.timestamp()
+    os.utime(path, (ts, ts))
+    return ts
+
+
 def normalize_orientation(value: Any) -> int:
     """Accept 0/90/180/270 clockwise quarter turns."""
     try:
@@ -90,19 +269,28 @@ def apply_orientation(im: Image.Image, orientation: int = 0) -> Image.Image:
     return im
 
 
+def apply_mirror(im: Image.Image, mirrored: bool = False) -> Image.Image:
+    """Horizontally flip image when mirrored is set."""
+    if mirrored:
+        return im.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+    return im
+
+
 def pixel_fingerprint(
-    path: Path, size: int = 16, orientation: int = 0
+    path: Path, size: int = 16, orientation: int = 0, mirrored: bool = False
 ) -> str | None:
     """Content fingerprint resilient to resize/re-encode/format change.
 
     Downscales to a tiny grayscale grid and hashes the pixels. Same photo saved
     as JPEG vs PNG (or at different resolutions) usually shares this hash.
     ``orientation`` applies a clockwise 90° factor after EXIF transpose.
+    ``mirrored`` applies a horizontal flip after orientation.
     """
     try:
         with Image.open(path) as im:
             im = ImageOps.exif_transpose(im)
             im = apply_orientation(im, orientation)
+            im = apply_mirror(im, mirrored)
             im = im.convert("L").resize((size, size), Image.Resampling.LANCZOS)
             return hashlib.sha1(im.tobytes()).hexdigest()
     except Exception:
@@ -220,6 +408,9 @@ def extract_exif_and_thumbnail(path: Path, thumb_dest: Path, size: int = 384) ->
         "camera": None,
         "lat": None,
         "lon": None,
+        "sharpness": None,
+        "exposure": None,
+        "quality": None,
     }
     try:
         with Image.open(path) as im:
@@ -270,6 +461,7 @@ def extract_exif_and_thumbnail(path: Path, thumb_dest: Path, size: int = 384) ->
             im.thumbnail((size, size))
             if im.mode not in ("RGB", "L"):
                 im = im.convert("RGB")
+            out.update(assess_image_quality(im if im.mode == "RGB" else im.convert("RGB")))
             thumb_dest.parent.mkdir(parents=True, exist_ok=True)
             im.save(thumb_dest, format="JPEG", quality=82, optimize=True)
     except Exception:
@@ -286,12 +478,27 @@ def album_from_rel(rel_path: str) -> str:
     return ""
 
 
+# Google Takeout / Albums folders that are never real places.
+_IGNORE_PLACE_LABELS = frozenset({"shared", "trash", "photos", "photo", "photos from"})
+
+
+def is_ignored_place_label(label: str | None) -> bool:
+    """True for non-place folder names (Shared, Trash, Photos, …)."""
+    if not label:
+        return False
+    key = label.strip().lower()
+    if key in _IGNORE_PLACE_LABELS:
+        return True
+    # "Photos 1", "Photos from 2023" → parsed as Photos / Photos from
+    return key.startswith("photos ") or key.startswith("photo ")
+
+
 def place_from_dirname(name: str) -> str | None:
     """Parse a folder name into a Place label.
 
     From the start: ``_`` → space; insert a space before each uppercase that
     follows a lowercase; stop on a digit or special character (``-`` and
-    spaces allowed).
+    spaces allowed). Ignores non-place folders such as Shared / Trash.
     """
     if not name:
         return None
@@ -311,7 +518,9 @@ def place_from_dirname(name: str) -> str | None:
             out.append(" ")
         out.append(ch)
     label = " ".join("".join(out).split())
-    return label or None
+    if not label or is_ignored_place_label(label):
+        return None
+    return label
 
 
 def deepest_dirname(rel_path: str) -> str:

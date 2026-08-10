@@ -11,9 +11,9 @@ from fastapi.staticfiles import StaticFiles
 from starlette.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from fotoman.config import THUMBS_DIR, ensure_dirs, load_settings
+from fotoman.config import THUMBS_DIR, ensure_dirs, load_settings, public_settings, update_settings
 from fotoman.db import content_thumb_path, db, init_db
-from fotoman import browse, duplicates, events, faces, indexer, properties, search
+from fotoman import browse, duplicates, events, faces, indexer, properties, search, vfolders, vqa
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -76,12 +76,21 @@ class PhotoIdsIn(BaseModel):
     delete_files: bool = False
 
 
+class VirtualFolderIn(BaseModel):
+    name: str
+
+
+class VirtualFolderNameIn(BaseModel):
+    name: str
+
+
 class PhotoPropertiesPatch(BaseModel):
     """Known editable fields. Add new optional fields here as the editor grows."""
 
     taken_at: str | None = None
     place_label: str | None = None
     orientation: int | None = None
+    mirrored: bool | None = None
 
 
 class PhotoPropertiesIn(BaseModel):
@@ -94,6 +103,8 @@ class RebuildDupesIn(BaseModel):
     exact: bool = True
     formatted: bool = False
     near: bool = True
+    photo_ids: list[int] | None = None
+    include_culled: bool = False
 
 
 class PersonNameIn(BaseModel):
@@ -101,9 +112,37 @@ class PersonNameIn(BaseModel):
     merge: bool = False
 
 
+class FaceNameIn(BaseModel):
+    name: str | None = None
+    merge: bool = False
+
+
+class ReclusterPeopleIn(BaseModel):
+    person_ids: list[int]
+    threshold: float | None = Field(default=None, ge=0.2, le=0.9)
+
+
 class FaceThresholdIn(BaseModel):
     threshold: float | None = Field(default=None, ge=0.2, le=0.9)
     source_id: int | None = None
+
+
+class SettingsIn(BaseModel):
+    model_id: str | None = None
+    near_dup_threshold: float | None = Field(default=None, ge=0.8, le=0.999)
+    face_match_threshold: float | None = Field(default=None, ge=0.2, le=0.9)
+    date_tree_order: str | None = Field(default=None, pattern="^(newest|oldest)$")
+    place_edit_nav: str | None = Field(default=None, pattern="^(stay|follow)$")
+    vqa_provider: str | None = None
+    vqa_api_key: str | None = None
+    vqa_base_url: str | None = None
+    vqa_model: str | None = None
+
+
+class VqaIn(BaseModel):
+    photo_id: int
+    prompt: str | None = Field(default=None, max_length=2000)
+    task: str | None = None
 
 
 def pick_directory(title: str = "Select photo archive") -> str | None:
@@ -149,7 +188,13 @@ def _startup() -> None:
     init_db()
     load_settings()
     faces.repair_orphaned_ready_flags()
+    faces.repair_orphan_person_links()
+    faces.purge_tiny_faces()
+    faces.refresh_person_covers()
     indexer.resume_if_interrupted()
+    from fotoman.geocode import start_geo_worker
+
+    start_geo_worker()
     # Incremental reindex (list + hash/EXIF deltas) before geocode/embed/faces.
     indexer.start_scan_all_enabled(high_priority=True)
     # Auto-queue optional work for archives with face/embed enabled.
@@ -189,7 +234,7 @@ def api_sources():
                    WHERE p.source_id = s.id AND c.faces_ready = 1) AS faces_ready_count,
                   (SELECT COUNT(DISTINCT c.id) FROM photos p
                    JOIN photo_contents c ON c.id = p.content_id
-                   WHERE p.source_id = s.id AND p.culled = 0 AND c.faces_ready = 0
+                   WHERE p.source_id = s.id AND p.culled = 0 AND p.missing = 0 AND c.faces_ready = 0
                   ) AS pending_faces_count
                 FROM sources s
                 ORDER BY s.id
@@ -367,7 +412,11 @@ def api_search(
     has_gps: bool | None = None,
     keepers_only: bool = False,
     include_culled: bool = False,
+    content_ids: str | None = None,
 ):
+    allow: set[int] | None = None
+    if content_ids and content_ids.strip():
+        allow = {int(x) for x in content_ids.split(",") if x.strip().isdigit()}
     if mode == "meta":
         return search.search_metadata(
             text=q or None,
@@ -383,6 +432,7 @@ def api_search(
             source_id=source_id,
             keepers_only=keepers_only,
             include_culled=include_culled,
+            content_ids=allow,
             limit=top_k,
         )
     if not q.strip():
@@ -401,8 +451,42 @@ def api_search(
             camera=camera,
             source_id=source_id,
             include_culled=include_culled,
+            content_ids=allow,
         )
-    return search.search_visual(q, top_k=top_k, include_culled=include_culled)
+    return search.search_visual(
+        q, top_k=top_k, include_culled=include_culled, content_ids=allow
+    )
+
+
+@app.get("/api/search/similar")
+def api_search_similar(
+    content_id: int | None = None,
+    photo_id: int | None = None,
+    top_k: int = Query(48, ge=1, le=200),
+    include_culled: bool = False,
+    content_ids: str | None = None,
+):
+    """Find photos visually similar to an embedded image (SigLIP / FAISS)."""
+    cid = content_id
+    if cid is None and photo_id is not None:
+        with db() as conn:
+            row = conn.execute(
+                "SELECT content_id FROM photos WHERE id = ?", (photo_id,)
+            ).fetchone()
+        if not row:
+            raise HTTPException(404, "Photo not found")
+        cid = int(row["content_id"])
+    if cid is None:
+        raise HTTPException(400, "content_id or photo_id required")
+    allow: set[int] | None = None
+    if content_ids and content_ids.strip():
+        allow = {int(x) for x in content_ids.split(",") if x.strip().isdigit()}
+    hits = search.search_similar(
+        cid, top_k=top_k, include_culled=include_culled, content_ids=allow
+    )
+    if hits is None:
+        raise HTTPException(404, "No embedding for this photo yet")
+    return hits
 
 
 @app.get("/api/browse/tree")
@@ -418,7 +502,11 @@ def api_browse_tree(
 
 @app.get("/api/browse/date-tree")
 def api_browse_date_tree(include_culled: bool = False):
-    return browse.date_tree(include_culled=include_culled)
+    order = str(load_settings().get("date_tree_order") or "newest").lower()
+    return browse.date_tree(
+        include_culled=include_culled,
+        newest_first=order != "oldest",
+    )
 
 
 @app.get("/api/browse/location-tree")
@@ -438,12 +526,13 @@ def api_browse_groups(
 def api_browse_photos(
     group_by: str = Query(
         "folder",
-        pattern="^(folder|camera|date|location|album|bundle|person|remove)$",
+        pattern="^(folder|camera|date|location|album|cluster|person|remove|vfolder)$",
     ),
     key: str = Query(""),
-    limit: int = Query(200, ge=1, le=500),
+    limit: int = Query(200, ge=1, le=10000),
     include_culled: bool = False,
     include_subfolders: bool = True,
+    labeled: bool | None = None,
 ):
     return browse.photos_for_group(
         group_by,
@@ -451,21 +540,79 @@ def api_browse_photos(
         limit,
         include_culled=include_culled,
         include_subfolders=include_subfolders,
+        labeled=labeled,
     )
 
 
-@app.get("/api/browse/bundles")
-def api_browse_bundles(
+@app.get("/api/virtual-folders")
+def api_list_virtual_folders(include_culled: bool = False):
+    return vfolders.list_folders(include_culled=include_culled)
+
+
+@app.post("/api/virtual-folders")
+def api_create_virtual_folder(body: VirtualFolderIn):
+    try:
+        return vfolders.create_folder(body.name)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    except vfolders.NameConflict as e:
+        raise HTTPException(
+            409,
+            detail={"code": "name_conflict", "existing": e.existing},
+        ) from e
+
+
+@app.patch("/api/virtual-folders/{folder_id}")
+def api_rename_virtual_folder(folder_id: int, body: VirtualFolderNameIn):
+    try:
+        return vfolders.rename_folder(folder_id, body.name)
+    except KeyError as e:
+        raise HTTPException(404, "Not found") from e
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    except vfolders.NameConflict as e:
+        raise HTTPException(
+            409,
+            detail={"code": "name_conflict", "existing": e.existing},
+        ) from e
+
+
+@app.delete("/api/virtual-folders/{folder_id}")
+def api_delete_virtual_folder(folder_id: int):
+    try:
+        return vfolders.delete_folder(folder_id)
+    except KeyError as e:
+        raise HTTPException(404, "Not found") from e
+
+
+@app.post("/api/virtual-folders/{folder_id}/members")
+def api_add_virtual_folder_members(folder_id: int, body: PhotoIdsIn):
+    try:
+        return vfolders.add_members(folder_id, body.photo_ids)
+    except KeyError as e:
+        raise HTTPException(404, "Not found") from e
+
+
+@app.delete("/api/virtual-folders/{folder_id}/members")
+def api_remove_virtual_folder_members(folder_id: int, body: PhotoIdsIn):
+    try:
+        return vfolders.remove_members(folder_id, body.photo_ids)
+    except KeyError as e:
+        raise HTTPException(404, "Not found") from e
+
+
+@app.get("/api/browse/clusters")
+def api_browse_clusters(
     threshold: float = Query(0.92, ge=0.8, le=0.999),
     limit: int = Query(50, ge=1, le=200),
     include_culled: bool = False,
 ):
-    return browse.bundle_list(threshold, limit, include_culled=include_culled)
+    return browse.cluster_list(threshold, limit, include_culled=include_culled)
 
 
 @app.get("/api/browse/people")
-def api_browse_people():
-    return faces.people_list()
+def api_browse_people(labeled: bool | None = None):
+    return faces.people_list(labeled=labeled)
 
 
 @app.patch("/api/people/{person_id}")
@@ -479,6 +626,41 @@ def api_update_person(person_id: int, body: PersonNameIn):
         ) from e
     except ValueError as e:
         raise HTTPException(404, str(e)) from e
+
+
+@app.patch("/api/faces/{face_id}")
+def api_update_face(face_id: int, body: FaceNameIn):
+    try:
+        return faces.set_face_name(face_id, body.name, merge=body.merge)
+    except faces.NameConflict as e:
+        raise HTTPException(
+            409,
+            detail={"code": "name_conflict", "existing": e.existing},
+        ) from e
+    except ValueError as e:
+        raise HTTPException(404, str(e)) from e
+
+
+@app.post("/api/faces/{face_id}/unknown")
+def api_assign_face_unknown(face_id: int):
+    try:
+        return faces.assign_face_unknown(face_id)
+    except ValueError as e:
+        raise HTTPException(404, str(e)) from e
+
+
+@app.delete("/api/faces/{face_id}")
+def api_delete_face(face_id: int):
+    """Dismiss a false-positive face detection."""
+    try:
+        return faces.delete_face(face_id)
+    except ValueError as e:
+        raise HTTPException(404, str(e)) from e
+
+
+@app.post("/api/people/recluster")
+def api_recluster_people(body: ReclusterPeopleIn):
+    return faces.recluster_people(body.person_ids, threshold=body.threshold)
 
 
 @app.post("/api/faces/rebuild")
@@ -575,6 +757,8 @@ def api_rebuild_dupes(body: RebuildDupesIn | None = None):
         exact=body.exact,
         formatted=body.formatted,
         near=body.near,
+        photo_ids=body.photo_ids,
+        include_culled=body.include_culled,
     )
 
 
@@ -609,6 +793,11 @@ def api_remove(body: PhotoIdsIn):
 @app.post("/api/duplicates/restore")
 def api_restore(body: PhotoIdsIn):
     return duplicates.restore_photos(body.photo_ids)
+
+
+@app.post("/api/duplicates/delete")
+def api_delete_photos(body: PhotoIdsIn):
+    return duplicates.delete_photos(body.photo_ids)
 
 
 @app.post("/api/duplicates/cull")
@@ -660,6 +849,31 @@ def api_original(photo_id: int):
     if not row or not Path(row["path"]).exists():
         raise HTTPException(404, "Not found")
     return FileResponse(row["path"])
+
+
+@app.get("/api/settings")
+def api_get_settings():
+    return public_settings()
+
+
+@app.post("/api/settings")
+def api_post_settings(body: SettingsIn):
+    patch = body.model_dump(exclude_unset=True)
+    return update_settings(patch)
+
+
+@app.post("/api/vqa")
+def api_vqa(body: VqaIn):
+    try:
+        return vqa.ask_photo(body.photo_id, body.prompt or "", body.task)
+    except LookupError as e:
+        raise HTTPException(404, str(e)) from e
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e)) from e
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(400, str(e)) from e
 
 
 app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")

@@ -10,18 +10,22 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from fotoman.db import PHOTO_SELECT, content_thumb_path, db, gc_orphaned_content
-from fotoman.geocode import lookup_city_coords, parse_city_country
+from fotoman.config import load_settings
+from fotoman.db import PHOTO_SELECT, content_thumb_path, db
+from fotoman.geocode import (
+    resolve_manual_place,
+)
 from fotoman.metadata import (
     file_sha1,
     normalize_orientation,
     normalize_taken_at,
     pixel_fingerprint,
     write_taken_at,
+    write_taken_at_mtime,
 )
 
 # Keys accepted in ``properties``. Handlers run in this order.
-KNOWN_PROPERTIES = ("taken_at", "place_label", "orientation")
+KNOWN_PROPERTIES = ("taken_at", "place_label", "orientation", "mirrored")
 
 
 def apply_properties(photo_ids: list[int], properties: dict[str, Any]) -> dict[str, Any]:
@@ -35,7 +39,12 @@ def apply_properties(photo_ids: list[int], properties: dict[str, Any]) -> dict[s
     clear_place = "place_label" in raw and (
         raw["place_label"] is None or str(raw["place_label"]).strip() == ""
     )
-    props = {k: v for k, v in raw.items() if v is not None and v != ""}
+    # ``mirrored: false`` is a valid update (bool False must not be dropped).
+    props = {
+        k: v
+        for k, v in raw.items()
+        if k == "mirrored" or (v is not None and v != "")
+    }
     if clear_place:
         props["place_label"] = ""
     unknown = sorted(set(props) - set(KNOWN_PROPERTIES))
@@ -52,19 +61,18 @@ def apply_properties(photo_ids: list[int], properties: dict[str, Any]) -> dict[s
         if clear_place:
             clear_place_fields = True
         else:
-            place = parse_city_country(str(props["place_label"]).strip())
-            if place.get("city") and place.get("country"):
-                place_coords = lookup_city_coords(
-                    place["city"], place["country"], place.get("region")
-                )
+            label = str(props["place_label"]).strip()
+            place, place_coords = resolve_manual_place(label, fetch=True)
     orientation = (
         normalize_orientation(props["orientation"]) if "orientation" in props else None
     )
+    mirrored = bool(props["mirrored"]) if "mirrored" in props else None
     if (
         taken_at is None
         and place is None
         and not clear_place_fields
         and orientation is None
+        and mirrored is None
     ):
         raise ValueError("No properties to update")
 
@@ -93,49 +101,87 @@ def apply_properties(photo_ids: list[int], properties: dict[str, Any]) -> dict[s
                     conn.execute(
                         """
                         UPDATE photo_contents
-                        SET place_label = NULL, city = NULL, region = NULL, country = NULL
+                        SET place_label = NULL, venue = NULL, city = NULL, region = NULL, country = NULL,
+                            lat = CASE WHEN IFNULL(gps, 0) = 0 THEN NULL ELSE lat END,
+                            lon = CASE WHEN IFNULL(gps, 0) = 0 THEN NULL ELSE lon END
                         WHERE id = ?
                         """,
                         (int(row["content_id"]),),
                     )
                 elif place is not None:
                     content_id = int(row["content_id"])
-                    # Keep existing EXIF GPS; only fill city-center coords when missing.
-                    set_lat = place_coords is not None and row.get("lat") is None
-                    set_lon = place_coords is not None and row.get("lon") is None
-                    conn.execute(
-                        """
-                        UPDATE photo_contents
-                        SET place_label = ?,
-                            city = ?,
-                            region = ?,
-                            country = ?,
-                            lat = CASE WHEN ? THEN ? ELSE lat END,
-                            lon = CASE WHEN ? THEN ? ELSE lon END
-                        WHERE id = ?
-                        """,
-                        (
-                            place["place_label"],
-                            place["city"],
-                            place["region"],
-                            place["country"],
-                            1 if set_lat else 0,
-                            place_coords[0] if place_coords else None,
-                            1 if set_lon else 0,
-                            place_coords[1] if place_coords else None,
-                            content_id,
-                        ),
-                    )
-                if orientation is not None:
+                    # Manual Place is the map tag: write geocoded city-center coords
+                    # (overwriting EXIF GPS). If geocode fails, clear stale city-center
+                    # pins but keep real EXIF GPS.
+                    if place_coords is not None:
+                        conn.execute(
+                            """
+                            UPDATE photo_contents
+                            SET place_label = ?,
+                                venue = ?,
+                                city = ?,
+                                region = ?,
+                                country = ?,
+                                lat = ?,
+                                lon = ?,
+                                gps = 0
+                            WHERE id = ?
+                            """,
+                            (
+                                place["place_label"],
+                                place.get("venue"),
+                                place["city"],
+                                place["region"],
+                                place["country"],
+                                place_coords[0],
+                                place_coords[1],
+                                content_id,
+                            ),
+                        )
+                    else:
+                        conn.execute(
+                            """
+                            UPDATE photo_contents
+                            SET place_label = ?,
+                                venue = ?,
+                                city = ?,
+                                region = ?,
+                                country = ?,
+                                lat = CASE WHEN IFNULL(gps, 0) = 1 THEN lat ELSE NULL END,
+                                lon = CASE WHEN IFNULL(gps, 0) = 1 THEN lon ELSE NULL END
+                            WHERE id = ?
+                            """,
+                            (
+                                place["place_label"],
+                                place.get("venue"),
+                                place["city"],
+                                place["region"],
+                                place["country"],
+                                content_id,
+                            ),
+                        )
+                if orientation is not None or mirrored is not None:
                     content_id = int(row["content_id"])
+                    new_orient = (
+                        orientation
+                        if orientation is not None
+                        else int(row.get("orientation") or 0)
+                    )
+                    new_mirror = (
+                        mirrored
+                        if mirrored is not None
+                        else bool(row.get("mirrored"))
+                    )
                     conn.execute(
-                        "UPDATE photo_contents SET orientation = ? WHERE id = ?",
-                        (orientation, content_id),
+                        "UPDATE photo_contents SET orientation = ?, mirrored = ? WHERE id = ?",
+                        (new_orient, 1 if new_mirror else 0, content_id),
                     )
                     thumb = content_thumb_path(content_id)
                     src = thumb if thumb.exists() else Path(row["path"])
                     fp = (
-                        pixel_fingerprint(src, orientation=orientation)
+                        pixel_fingerprint(
+                            src, orientation=new_orient, mirrored=new_mirror
+                        )
                         if src.exists()
                         else None
                     )
@@ -146,12 +192,38 @@ def apply_properties(photo_ids: list[int], properties: dict[str, Any]) -> dict[s
                         )
                 if taken_at is not None:
                     path = Path(row["path"])
-                    if not path.is_file():
-                        errors.append({"photo_id": pid, "error": "File missing"})
-                        continue
-                    write_taken_at(path, taken_at)
-                    _relink_after_file_change(conn, row, taken_at=taken_at)
-                    save_faiss = True
+                    settings = load_settings()
+                    write_exif = bool(settings.get("write_date_to_exif"))
+                    write_mtime = bool(settings.get("write_date_to_mtime"))
+                    wrote_exif = False
+                    if write_exif and path.is_file():
+                        try:
+                            write_taken_at(path, taken_at)
+                            wrote_exif = True
+                        except Exception:
+                            pass
+                    if write_mtime and path.is_file():
+                        try:
+                            new_mtime = write_taken_at_mtime(path, taken_at)
+                            conn.execute(
+                                "UPDATE photos SET mtime = ? WHERE id = ?",
+                                (new_mtime, int(row["id"])),
+                            )
+                        except Exception:
+                            pass
+                    if wrote_exif:
+                        _relink_after_file_change(conn, row, taken_at=taken_at)
+                        save_faiss = True
+                    else:
+                        # DB-only (default), or EXIF write unsupported/failed.
+                        conn.execute(
+                            """
+                            UPDATE photo_contents
+                            SET taken_at = ?, taken_at_source = 'manual'
+                            WHERE id = ?
+                            """,
+                            (taken_at, int(row["content_id"])),
+                        )
                 updated += 1
             except Exception as e:
                 errors.append({"photo_id": pid, "error": str(e)})
@@ -164,7 +236,17 @@ def apply_properties(photo_ids: list[int], properties: dict[str, Any]) -> dict[s
         except Exception:
             pass
 
-    return {"updated": updated, "errors": errors}
+    out: dict[str, Any] = {"updated": updated, "errors": errors}
+    if clear_place_fields:
+        out["place"] = None
+    elif place is not None:
+        place_out = dict(place)
+        if place_coords is not None:
+            place_out["lat"] = place_coords[0]
+            place_out["lon"] = place_coords[1]
+            place_out["gps"] = 0
+        out["place"] = place_out
+    return out
 
 
 def _relink_after_file_change(
@@ -199,7 +281,11 @@ def _relink_after_file_change(
 
     if existing and int(existing["id"]) == old_content_id:
         conn.execute(
-            "UPDATE photo_contents SET taken_at = ?, size = ? WHERE id = ?",
+            """
+            UPDATE photo_contents
+            SET taken_at = ?, taken_at_source = 'manual', size = ?
+            WHERE id = ?
+            """,
             (taken_at, size, old_content_id),
         )
         return
@@ -207,21 +293,24 @@ def _relink_after_file_change(
     if existing:
         new_id = int(existing["id"])
         conn.execute(
-            "UPDATE photo_contents SET taken_at = ?, size = COALESCE(size, ?) WHERE id = ?",
+            """
+            UPDATE photo_contents
+            SET taken_at = ?, taken_at_source = 'manual', size = COALESCE(size, ?)
+            WHERE id = ?
+            """,
             (taken_at, size, new_id),
         )
         conn.execute(
             "UPDATE photos SET content_id = ? WHERE id = ?",
             (new_id, photo_id),
         )
-        gc_orphaned_content(conn, old_content_id)
         return
 
     if refcount == 1:
         conn.execute(
             """
             UPDATE photo_contents
-            SET file_hash = ?, size = ?, taken_at = ?
+            SET file_hash = ?, size = ?, taken_at = ?, taken_at_source = 'manual'
             WHERE id = ?
             """,
             (new_hash, size, taken_at, old_content_id),
@@ -235,10 +324,11 @@ def _relink_after_file_change(
     cur = conn.execute(
         """
         INSERT INTO photo_contents(
-            file_hash, size, width, height, taken_at, camera,
-            lat, lon, city, region, country, place_label, orientation, fingerprint,
+            file_hash, size, width, height, taken_at, taken_at_source, camera,
+            lat, lon, gps, city, region, country, place_label, orientation, mirrored, fingerprint,
+            sharpness, exposure, quality,
             embedding_ready, faces_ready, indexed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             new_hash,
@@ -246,15 +336,21 @@ def _relink_after_file_change(
             old["width"],
             old["height"],
             taken_at,
+            "manual",
             old["camera"],
             old["lat"],
             old["lon"],
+            int(old["gps"] or 0),
             old["city"],
             old["region"],
             old["country"],
             old["place_label"],
             int(old["orientation"] or 0),
+            int(old["mirrored"] or 0),
             old["fingerprint"],
+            old["sharpness"],
+            old["exposure"],
+            old["quality"],
             old["embedding_ready"],
             old["faces_ready"],
             old["indexed_at"],

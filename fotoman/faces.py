@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
 import threading
 import urllib.request
@@ -49,6 +50,15 @@ _suspend_requested = False
 # Per-archive face jobs waiting to run: {source_id, threshold}.
 _pending: deque[dict[str, Any]] = deque()
 
+# Skip detections smaller than this on the original image (px on the short side).
+# Tiny crops produce noisy embeddings and unrealistically small boxes in the UI.
+MIN_FACE_SIDE_PX = 32
+# Also skip faces whose short side is below this fraction of the image dimension.
+# Absolute px alone still lets flecks through on very large photos.
+MIN_FACE_REL = 0.02
+# Unlabeled people need at least one face this large to appear in the People tree.
+TREE_FACE_SIDE_PX = 64
+
 
 def get_status() -> dict[str, Any]:
     with _lock:
@@ -75,7 +85,7 @@ def count_pending_faces(source_id: int | None = None) -> int:
                 SELECT COUNT(DISTINCT c.id) AS c
                 FROM photo_contents c
                 JOIN photos p ON p.content_id = c.id
-                WHERE p.culled = 0 AND c.faces_ready = 0
+                WHERE p.culled = 0 AND p.missing = 0 AND c.faces_ready = 0
                 """
             ).fetchone()
         else:
@@ -84,7 +94,7 @@ def count_pending_faces(source_id: int | None = None) -> int:
                 SELECT COUNT(DISTINCT c.id) AS c
                 FROM photo_contents c
                 JOIN photos p ON p.content_id = c.id
-                WHERE p.culled = 0 AND c.faces_ready = 0 AND p.source_id = ?
+                WHERE p.culled = 0 AND p.missing = 0 AND c.faces_ready = 0 AND p.source_id = ?
                 """,
                 (source_id,),
             ).fetchone()
@@ -102,12 +112,21 @@ def sources_with_pending_faces() -> list[int]:
               AND EXISTS (
                 SELECT 1 FROM photos p
                 JOIN photo_contents c ON c.id = p.content_id
-                WHERE p.source_id = s.id AND p.culled = 0 AND c.faces_ready = 0
+                WHERE p.source_id = s.id AND p.culled = 0 AND p.missing = 0 AND c.faces_ready = 0
               )
             ORDER BY s.id
             """
         ).fetchall()
     return [int(r["id"]) for r in rows if Path(r["path"]).exists()]
+
+
+def repair_orphan_person_links() -> int:
+    """Reattach faces pointing at missing people (e.g. deletes with FKs off)."""
+    with db() as conn:
+        n = _repair_orphan_faces(conn)
+        if n:
+            _recalc_people(conn)
+        return n
 
 
 def repair_orphaned_ready_flags() -> int:
@@ -136,6 +155,41 @@ def repair_orphaned_ready_flags() -> int:
     settings["faces_ready_repaired_v1"] = True
     save_settings(settings)
     return cleared
+
+
+def purge_tiny_faces() -> int:
+    """One-shot: drop face rows whose bbox is unrealistically small on the image."""
+    from fotoman.config import load_settings, save_settings
+
+    settings = load_settings()
+    if settings.get("tiny_faces_purged_v2"):
+        return 0
+    deleted = 0
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT f.id
+            FROM faces f
+            JOIN photo_contents c ON c.id = f.content_id
+            WHERE MIN(f.bbox_w * c.width, f.bbox_h * c.height) < ?
+               OR MIN(f.bbox_w, f.bbox_h) < ?
+            """,
+            (MIN_FACE_SIDE_PX, MIN_FACE_REL),
+        ).fetchall()
+        ids = [int(r["id"]) for r in rows]
+        face_dir = THUMBS_DIR / "faces"
+        for fid in ids:
+            if face_dir.exists():
+                face_thumb_path(fid).unlink(missing_ok=True)
+        for chunk in _chunked_ids(ids):
+            placeholders = ",".join("?" * len(chunk))
+            conn.execute(f"DELETE FROM faces WHERE id IN ({placeholders})", chunk)
+            deleted += len(chunk)
+        if deleted:
+            _recalc_people(conn)
+    settings["tiny_faces_purged_v2"] = True
+    save_settings(settings)
+    return deleted
 
 
 def _enqueue_face_job_unlocked(job: dict[str, Any]) -> None:
@@ -286,6 +340,17 @@ def _detect_and_embed(path: Path) -> list[dict[str, Any]]:
 
     out: list[dict[str, Any]] = []
     for row in faces:
+        bx, by, bw, bh = float(row[0]), float(row[1]), float(row[2]), float(row[3])
+        if scale != 1.0:
+            obx, oby, obw, obh = bx / scale, by / scale, bw / scale, bh / scale
+            ow, oh = w / scale, h / scale
+        else:
+            obx, oby, obw, obh = bx, by, bw, bh
+            ow, oh = float(w), float(h)
+        if min(obw, obh) < MIN_FACE_SIDE_PX:
+            continue
+        if min(obw / ow, obh / oh) < MIN_FACE_REL:
+            continue
         face_row = row.reshape(1, -1)
         try:
             aligned = recognizer.alignCrop(img, face_row)
@@ -295,21 +360,12 @@ def _detect_and_embed(path: Path) -> list[dict[str, Any]]:
         vec = np.asarray(feat, dtype=np.float32).reshape(-1)
         if vec.size == 0:
             continue
-        bx, by, bw, bh = float(row[0]), float(row[1]), float(row[2]), float(row[3])
-        if scale != 1.0:
-            bx /= scale
-            by /= scale
-            bw /= scale
-            bh /= scale
-            ow, oh = w / scale, h / scale
-        else:
-            ow, oh = float(w), float(h)
         out.append(
             {
-                "bbox_x": max(0.0, bx / ow),
-                "bbox_y": max(0.0, by / oh),
-                "bbox_w": min(1.0, bw / ow),
-                "bbox_h": min(1.0, bh / oh),
+                "bbox_x": max(0.0, obx / ow),
+                "bbox_y": max(0.0, oby / oh),
+                "bbox_w": min(1.0, obw / ow),
+                "bbox_h": min(1.0, obh / oh),
                 "det_score": float(row[14]) if len(row) > 14 else None,
                 "embedding": vec,
             }
@@ -361,15 +417,25 @@ def _cluster(embeddings: np.ndarray, threshold: float) -> list[int]:
     return labels
 
 
+# Face belongs to at least one non-removed photo location.
+_LIVE_FACE_SQL = """
+EXISTS (
+  SELECT 1 FROM photos ph
+  WHERE ph.content_id = f.content_id AND ph.culled = 0 AND ph.missing = 0
+)
+"""
+
+
 def _existing_person_centroids() -> list[tuple[int, str | None, np.ndarray]]:
-    """person_id, name, L2-normalized mean embedding."""
+    """person_id, name, L2-normalized mean embedding (live photos only)."""
     with db() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT p.id, p.name, f.embedding
             FROM people p
             JOIN faces f ON f.person_id = p.id
             WHERE f.embedding IS NOT NULL
+              AND {_LIVE_FACE_SQL}
             """
         ).fetchall()
     by_id: dict[int, dict[str, Any]] = {}
@@ -388,17 +454,192 @@ def _existing_person_centroids() -> list[tuple[int, str | None, np.ndarray]]:
     return out
 
 
-def _recalc_people(conn) -> None:
+def _pick_cover_face_id(face_rows: list[Any]) -> int | None:
+    """Face closest to the group mean embedding; else lowest id."""
+    if not face_rows:
+        return None
+    vecs: list[np.ndarray] = []
+    ids: list[int] = []
+    for r in face_rows:
+        emb = r["embedding"]
+        if emb is None:
+            continue
+        v = np.frombuffer(emb, dtype=np.float32)
+        if v.size:
+            vecs.append(v)
+            ids.append(int(r["id"]))
+    if vecs:
+        mean = np.mean(np.stack(vecs), axis=0).astype(np.float32)
+        mean_n = float(np.linalg.norm(mean)) + 1e-9
+        mean = mean / mean_n
+        best_id = ids[0]
+        best_sim = -1.0
+        for fid, v in zip(ids, vecs):
+            vn = v / (float(np.linalg.norm(v)) + 1e-9)
+            sim = float(vn @ mean)
+            if sim > best_sim:
+                best_sim = sim
+                best_id = fid
+        return best_id
+    return min(int(r["id"]) for r in face_rows)
+
+
+def _repair_orphan_faces(conn) -> int:
+    """Reattach faces whose person_id is NULL or points at a deleted person.
+
+    Faces that shared a missing person_id stay together on one new person.
+    """
+    orphans = conn.execute(
+        """
+        SELECT f.id, f.person_id
+        FROM faces f
+        LEFT JOIN people p ON p.id = f.person_id
+        WHERE p.id IS NULL
+        """
+    ).fetchall()
+    if not orphans:
+        return 0
+    by_old: dict[int | None, list[int]] = {}
+    for r in orphans:
+        key = int(r["person_id"]) if r["person_id"] is not None else None
+        by_old.setdefault(key, []).append(int(r["id"]))
+    fixed = 0
+    for old_pid, face_ids in by_old.items():
+        if old_pid is None:
+            # Unassigned: each face gets its own person shell.
+            for fid in face_ids:
+                cur = conn.execute(
+                    "INSERT INTO people (name, face_count) VALUES (NULL, 1)"
+                )
+                conn.execute(
+                    "UPDATE faces SET person_id = ? WHERE id = ?",
+                    (int(cur.lastrowid), fid),
+                )
+                fixed += 1
+            continue
+        cur = conn.execute(
+            "INSERT INTO people (name, face_count) VALUES (NULL, ?)",
+            (len(face_ids),),
+        )
+        new_pid = int(cur.lastrowid)
+        conn.executemany(
+            "UPDATE faces SET person_id = ? WHERE id = ?",
+            [(new_pid, fid) for fid in face_ids],
+        )
+        fixed += len(face_ids)
+    return fixed
+
+
+def _recalc_people(conn, person_ids: list[int] | None = None) -> None:
+    """Refresh face_count, drop empties, refresh covers.
+
+    When ``person_ids`` is set, only those people are touched (label/merge hot path).
+    Full recalc (``person_ids is None``) still repairs orphans and rebuilds everyone.
+    """
+    if person_ids is not None:
+        ids = sorted({int(p) for p in person_ids if p is not None})
+        if not ids:
+            return
+        placeholders = ",".join("?" * len(ids))
+        conn.execute(
+            f"""
+            UPDATE people SET
+              face_count = (SELECT COUNT(*) FROM faces WHERE person_id = people.id)
+            WHERE id IN ({placeholders})
+            """,
+            ids,
+        )
+        conn.execute(
+            f"""
+            DELETE FROM people
+            WHERE id IN ({placeholders})
+              AND NOT EXISTS (
+                SELECT 1 FROM faces f WHERE f.person_id = people.id
+              )
+            """,
+            ids,
+        )
+        surviving = [
+            int(r["id"])
+            for r in conn.execute(
+                f"SELECT id FROM people WHERE id IN ({placeholders})", ids
+            ).fetchall()
+        ]
+        if not surviving:
+            return
+        sph = ",".join("?" * len(surviving))
+        rows = conn.execute(
+            f"""
+            SELECT f.person_id, f.id, f.embedding
+            FROM faces f
+            WHERE f.person_id IN ({sph})
+              AND {_LIVE_FACE_SQL}
+            """,
+            surviving,
+        ).fetchall()
+        by_person: dict[int, list[Any]] = {pid: [] for pid in surviving}
+        for r in rows:
+            by_person[int(r["person_id"])].append(r)
+        conn.executemany(
+            "UPDATE people SET cover_face_id = ? WHERE id = ?",
+            [
+                (_pick_cover_face_id(face_rows) if face_rows else None, pid)
+                for pid, face_rows in by_person.items()
+            ],
+        )
+        return
+
+    _repair_orphan_faces(conn)
     conn.execute(
         """
         UPDATE people SET
-          face_count = (SELECT COUNT(*) FROM faces WHERE person_id = people.id),
-          cover_face_id = (
-            SELECT id FROM faces WHERE person_id = people.id ORDER BY id LIMIT 1
-          )
+          face_count = (SELECT COUNT(*) FROM faces WHERE person_id = people.id)
         """
     )
-    conn.execute("DELETE FROM people WHERE face_count = 0")
+    # Subquery delete: never drop a person that still has face rows
+    # (stale face_count + missing FK used to create orphans).
+    conn.execute(
+        """
+        DELETE FROM people
+        WHERE NOT EXISTS (
+          SELECT 1 FROM faces f WHERE f.person_id = people.id
+        )
+        """
+    )
+    # Covers / centers from live (non-removed) photos only.
+    conn.execute("UPDATE people SET cover_face_id = NULL")
+    rows = conn.execute(
+        f"""
+        SELECT f.person_id, f.id, f.embedding
+        FROM faces f
+        WHERE f.person_id IS NOT NULL
+          AND {_LIVE_FACE_SQL}
+        """
+    ).fetchall()
+    by_person: dict[int, list[Any]] = {}
+    for r in rows:
+        by_person.setdefault(int(r["person_id"]), []).append(r)
+    updates: list[tuple[int | None, int]] = []
+    for pid, face_rows in by_person.items():
+        updates.append((_pick_cover_face_id(face_rows), pid))
+    if updates:
+        conn.executemany(
+            "UPDATE people SET cover_face_id = ? WHERE id = ?",
+            updates,
+        )
+
+
+def refresh_person_covers() -> None:
+    """One-shot: replace oldest-face covers with centroid-nearest faces."""
+    from fotoman.config import load_settings, save_settings
+
+    settings = load_settings()
+    if settings.get("person_covers_centroid_v1"):
+        return
+    with db() as conn:
+        _recalc_people(conn)
+    settings["person_covers_centroid_v1"] = True
+    save_settings(settings)
 
 
 def _chunked_ids(ids: list[int], size: int = 500):
@@ -491,7 +732,7 @@ def _commit_detected_batch(
             "UPDATE photo_contents SET faces_ready = 1 WHERE id = ?",
             [(cid,) for cid in ready_ids],
         )
-        _recalc_people(conn)
+        _recalc_people(conn, list(person_for_cluster.values()))
         n_people = conn.execute("SELECT COUNT(*) AS c FROM people").fetchone()["c"]
 
     return int(n_people), _existing_person_centroids()
@@ -678,7 +919,7 @@ def _rebuild_inner(
                     SELECT c.id AS content_id, MIN(p.path) AS path, c.faces_ready
                     FROM photo_contents c
                     JOIN photos p ON p.content_id = c.id
-                    WHERE p.culled = 0 AND p.source_id = ? AND c.faces_ready = 0
+                    WHERE p.culled = 0 AND p.missing = 0 AND p.source_id = ? AND c.faces_ready = 0
                     GROUP BY c.id
                     ORDER BY c.id
                     """,
@@ -693,7 +934,7 @@ def _rebuild_inner(
                     SELECT c.id AS content_id, MIN(p.path) AS path, c.faces_ready
                     FROM photo_contents c
                     JOIN photos p ON p.content_id = c.id
-                    WHERE p.culled = 0 AND c.faces_ready = 0
+                    WHERE p.culled = 0 AND p.missing = 0 AND c.faces_ready = 0
                     GROUP BY c.id
                     ORDER BY c.id
                     """
@@ -801,7 +1042,11 @@ def _rebuild_inner(
 
 _PERSON_SELECT = """
     SELECT p.id, p.name, p.face_count, p.cover_face_id,
-           (SELECT COUNT(DISTINCT content_id) FROM faces WHERE person_id = p.id) AS photo_count
+           (SELECT COUNT(DISTINCT f.content_id)
+              FROM faces f
+              JOIN photos ph ON ph.content_id = f.content_id
+               AND ph.culled = 0 AND ph.missing = 0 AND ph.is_keeper = 1
+             WHERE f.person_id = p.id) AS photo_count
     FROM people p
 """
 
@@ -814,14 +1059,25 @@ class NameConflict(Exception):
         super().__init__("name_conflict")
 
 
+_UNKNOWN_LABEL_RE = re.compile(r"^unknown\s+(\d+)$", re.IGNORECASE)
+
+
+def is_person_labeled(name: str | None) -> bool:
+    """True when the person has a real name (not empty / ``Unknown N``)."""
+    label = (name or "").strip()
+    return bool(label) and not _UNKNOWN_LABEL_RE.match(label)
+
+
 def _person_dict(row: Any) -> dict[str, Any]:
     d = dict(row)
     d["display_name"] = (d["name"] or "").strip() or f"Person {d['id']}"
+    d["labeled"] = is_person_labeled(d.get("name"))
     return d
 
 
-def people_list() -> list[dict[str, Any]]:
-    # One aggregated JOIN — not a correlated photo_count subquery per person.
+def people_list(*, labeled: bool | None = None) -> list[dict[str, Any]]:
+    # Count keeper photos only — matches thumbs/cards gallery (non-keepers hidden).
+    # Unlabeled clusters need a significant face; named people always show.
     with db() as conn:
         rows = conn.execute(
             """
@@ -831,19 +1087,35 @@ def people_list() -> list[dict[str, Any]]:
             LEFT JOIN (
               SELECT f.person_id, COUNT(DISTINCT f.content_id) AS photo_count
               FROM faces f
-              JOIN photos ph ON ph.content_id = f.content_id AND ph.culled = 0
+              JOIN photos ph ON ph.content_id = f.content_id
+                AND ph.culled = 0 AND ph.missing = 0 AND ph.is_keeper = 1
               JOIN sources s ON s.id = ph.source_id
               GROUP BY f.person_id
             ) pc ON pc.person_id = p.id
-            WHERE p.face_count > 0
+            WHERE COALESCE(pc.photo_count, 0) > 0
+              AND (
+                (p.name IS NOT NULL AND trim(p.name) != '')
+                OR EXISTS (
+                  SELECT 1
+                  FROM faces f2
+                  JOIN photo_contents c ON c.id = f2.content_id
+                  JOIN photos ph2 ON ph2.content_id = f2.content_id
+                    AND ph2.culled = 0 AND ph2.missing = 0 AND ph2.is_keeper = 1
+                  WHERE f2.person_id = p.id
+                    AND MIN(f2.bbox_w * c.width, f2.bbox_h * c.height) >= ?
+                )
+              )
             ORDER BY
-              CASE WHEN p.name IS NULL OR p.name = '' THEN 1 ELSE 0 END,
-              lower(COALESCE(p.name, '')),
-              photo_count DESC,
+              CASE WHEN p.name IS NULL OR trim(p.name) = '' THEN 1 ELSE 0 END,
+              lower(trim(COALESCE(p.name, ''))),
               p.id
-            """
+            """,
+            (TREE_FACE_SIDE_PX,),
         ).fetchall()
-    return [_person_dict(r) for r in rows]
+    people = [_person_dict(r) for r in rows]
+    if labeled is None:
+        return people
+    return [p for p in people if bool(p["labeled"]) is labeled]
 
 
 def merge_people(
@@ -872,7 +1144,7 @@ def merge_people(
             conn.execute(
                 "UPDATE people SET name = ? WHERE id = ?", (label, keep_id)
             )
-        _recalc_people(conn)
+        _recalc_people(conn, [keep_id, absorb_id])
         row = conn.execute(
             f"{_PERSON_SELECT} WHERE p.id = ?", (keep_id,)
         ).fetchone()
@@ -945,12 +1217,296 @@ def set_person_name(
     return merge_people(absorb_into, person_id, name=label)
 
 
+def _find_named_person(
+    conn, label: str, *, exclude_id: int | None = None
+) -> Any | None:
+    sql = f"""
+        {_PERSON_SELECT}
+        WHERE p.name IS NOT NULL AND trim(p.name) != ''
+          AND lower(trim(p.name)) = lower(?)
+          AND p.face_count > 0
+    """
+    args: list[Any] = [label]
+    if exclude_id is not None:
+        sql += " AND p.id != ?"
+        args.append(exclude_id)
+    sql += " ORDER BY photo_count DESC, p.id LIMIT 1"
+    return conn.execute(sql, args).fetchone()
+
+
+def next_unknown_label(conn: Any | None = None) -> str:
+    """Return the next unused ``Unknown N`` label (N = max existing + 1)."""
+
+    def _scan(c: Any) -> str:
+        rows = c.execute(
+            """
+            SELECT name FROM people
+            WHERE name IS NOT NULL AND trim(name) != ''
+            """
+        ).fetchall()
+        max_n = 0
+        for r in rows:
+            m = _UNKNOWN_LABEL_RE.match((r["name"] or "").strip())
+            if m:
+                max_n = max(max_n, int(m.group(1)))
+        return f"Unknown {max_n + 1}"
+
+    if conn is not None:
+        return _scan(conn)
+    with db() as c:
+        return _scan(c)
+
+
+def assign_face_unknown(face_id: int) -> dict[str, Any]:
+    """Label one face with the next ``Unknown N`` (instance only)."""
+    for _ in range(8):
+        label = next_unknown_label()
+        try:
+            return set_face_name(face_id, label, merge=False)
+        except NameConflict:
+            continue
+    raise ValueError("Could not allocate Unknown label")
+
+
+def set_face_name(
+    face_id: int, name: str | None, *, merge: bool = False
+) -> dict[str, Any]:
+    """Label or correct one face instance only (never the whole group).
+
+    Returns person dict plus face_id and scope ("face").
+    """
+    label = (name or "").strip() or None
+    with db() as conn:
+        face = conn.execute(
+            """
+            SELECT f.id, f.person_id, p.id AS person_row_id,
+                   p.name AS person_name, p.face_count
+            FROM faces f
+            LEFT JOIN people p ON p.id = f.person_id
+            WHERE f.id = ?
+            """,
+            (face_id,),
+        ).fetchone()
+        if not face:
+            raise ValueError(f"Face not found: {face_id}")
+        # Orphaned face (missing/deleted person): create a shell person.
+        if face["person_row_id"] is None:
+            cur = conn.execute(
+                "INSERT INTO people (name, face_count) VALUES (NULL, 1)"
+            )
+            person_id = int(cur.lastrowid)
+            conn.execute(
+                "UPDATE faces SET person_id = ? WHERE id = ?",
+                (person_id, face_id),
+            )
+            face_count = 1
+            current = None
+        else:
+            person_id = int(face["person_id"])
+            face_count = int(face["face_count"] or 0)
+            current = (face["person_name"] or "").strip() or None
+        if label == current:
+            row = conn.execute(
+                f"{_PERSON_SELECT} WHERE p.id = ?", (person_id,)
+            ).fetchone()
+            return {**_person_dict(row), "face_id": face_id, "scope": "face"}
+
+        if label is not None:
+            existing = _find_named_person(conn, label, exclude_id=person_id)
+            if existing is not None:
+                if not merge:
+                    raise NameConflict(_person_dict(existing))
+                keep_id = int(existing["id"])
+                conn.execute(
+                    "UPDATE faces SET person_id = ? WHERE id = ?",
+                    (keep_id, face_id),
+                )
+                _recalc_people(conn, [keep_id, person_id])
+                row = conn.execute(
+                    f"{_PERSON_SELECT} WHERE p.id = ?", (keep_id,)
+                ).fetchone()
+                return {**_person_dict(row), "face_id": face_id, "scope": "face"}
+
+        # Sole face: rename/clear in place.
+        if face_count <= 1:
+            try:
+                conn.execute(
+                    "UPDATE people SET name = ? WHERE id = ?", (label, person_id)
+                )
+            except sqlite3.IntegrityError as e:
+                if label is None:
+                    raise
+                existing = _find_named_person(conn, label, exclude_id=person_id)
+                if existing is not None:
+                    raise NameConflict(_person_dict(existing)) from e
+                raise
+            row = conn.execute(
+                f"{_PERSON_SELECT} WHERE p.id = ?", (person_id,)
+            ).fetchone()
+            return {**_person_dict(row), "face_id": face_id, "scope": "face"}
+
+        # Split face onto a new person (named or unlabeled).
+        try:
+            cur = conn.execute(
+                "INSERT INTO people (name, face_count) VALUES (?, 1)", (label,)
+            )
+        except sqlite3.IntegrityError as e:
+            if label is None:
+                raise
+            existing = _find_named_person(conn, label, exclude_id=person_id)
+            if existing is not None:
+                raise NameConflict(_person_dict(existing)) from e
+            raise
+        new_id = int(cur.lastrowid)
+        conn.execute(
+            "UPDATE faces SET person_id = ? WHERE id = ?", (new_id, face_id)
+        )
+        _recalc_people(conn, [person_id, new_id])
+        row = conn.execute(
+            f"{_PERSON_SELECT} WHERE p.id = ?", (new_id,)
+        ).fetchone()
+        return {**_person_dict(row), "face_id": face_id, "scope": "face"}
+
+
+def recluster_people(
+    person_ids: list[int], threshold: float | None = None
+) -> dict[str, Any]:
+    """Recluster faces belonging to the given person ids only.
+
+    Unlabeled faces whose embedding is directly similar to a named person's
+    centroid join that person. Remaining unlabeled faces are regrouped among
+    themselves (no transitive absorb of the whole old blob). Named faces
+    never move. Does not touch faces outside this id set.
+    """
+    ids = sorted({int(p) for p in person_ids if p is not None})
+    if not ids:
+        return {"faces": 0, "moved": 0, "person_ids": []}
+
+    settings = load_settings()
+    thr = (
+        float(threshold)
+        if threshold is not None
+        else float(settings.get("face_match_threshold", FACE_MATCH_THRESHOLD))
+    )
+
+    with db() as conn:
+        placeholders = ",".join("?" * len(ids))
+        rows = conn.execute(
+            f"""
+            SELECT f.id, f.person_id, f.embedding, p.name AS person_name
+            FROM faces f
+            JOIN people p ON p.id = f.person_id
+            WHERE f.person_id IN ({placeholders})
+              AND f.embedding IS NOT NULL
+              AND {_LIVE_FACE_SQL}
+            ORDER BY f.id
+            """,
+            ids,
+        ).fetchall()
+
+        named_rows = [r for r in rows if (r["person_name"] or "").strip()]
+        unlabeled = [r for r in rows if not (r["person_name"] or "").strip()]
+        touched: set[int] = set(ids)
+
+        # Centroids for named people in the pool.
+        named_vecs: dict[int, list[np.ndarray]] = {}
+        for r in named_rows:
+            pid = int(r["person_id"])
+            vec = np.frombuffer(r["embedding"], dtype=np.float32)
+            if vec.size:
+                named_vecs.setdefault(pid, []).append(vec)
+        named_cent: dict[int, np.ndarray] = {}
+        for pid, vecs in named_vecs.items():
+            mean = np.mean(np.stack(vecs), axis=0).astype(np.float32)
+            faiss.normalize_L2(mean.reshape(1, -1))
+            named_cent[pid] = mean
+
+        moved = 0
+        still_unlabeled: list[Any] = []
+
+        # Direct match only: join nearest named centroid if score >= thr.
+        named_pids = list(named_cent.keys())
+        for r in unlabeled:
+            fid = int(r["id"])
+            old_pid = int(r["person_id"])
+            vec = np.frombuffer(r["embedding"], dtype=np.float32).astype(np.float32)
+            if not named_pids or not vec.size:
+                still_unlabeled.append(r)
+                continue
+            faiss.normalize_L2(vec.reshape(1, -1))
+            best_pid = None
+            best = -1.0
+            for pid in named_pids:
+                score = float(np.dot(vec, named_cent[pid]))
+                if score > best:
+                    best = score
+                    best_pid = pid
+            if best_pid is not None and best >= thr and best_pid != old_pid:
+                conn.execute(
+                    "UPDATE faces SET person_id = ? WHERE id = ?",
+                    (best_pid, fid),
+                )
+                touched.add(best_pid)
+                touched.add(old_pid)
+                moved += 1
+            elif best_pid is not None and best >= thr:
+                # Already on that person.
+                pass
+            else:
+                still_unlabeled.append(r)
+
+        # Regroup leftovers that did not join any named person.
+        if len(still_unlabeled) >= 2:
+            face_ids = [int(r["id"]) for r in still_unlabeled]
+            old_pids = [int(r["person_id"]) for r in still_unlabeled]
+            old_by_face = {fid: old_pids[i] for i, fid in enumerate(face_ids)}
+            emb = np.stack(
+                [
+                    np.frombuffer(r["embedding"], dtype=np.float32)
+                    for r in still_unlabeled
+                ]
+            ).astype(np.float32)
+            labels = _cluster(emb, thr)
+            by_cluster: dict[int, list[int]] = {}
+            for i, lab in enumerate(labels):
+                by_cluster.setdefault(int(lab), []).append(i)
+
+            claimed_pids = set(named_cent.keys())
+            for idxs in by_cluster.values():
+                candidates = sorted({old_pids[i] for i in idxs})
+                target = next((p for p in candidates if p not in claimed_pids), None)
+                if target is None:
+                    cur = conn.execute(
+                        "INSERT INTO people (name, face_count) VALUES (NULL, 0)"
+                    )
+                    target = int(cur.lastrowid)
+                claimed_pids.add(target)
+                touched.add(target)
+                for i in idxs:
+                    fid = face_ids[i]
+                    if old_by_face[fid] == target:
+                        continue
+                    conn.execute(
+                        "UPDATE faces SET person_id = ? WHERE id = ?",
+                        (target, fid),
+                    )
+                    touched.add(old_by_face[fid])
+                    moved += 1
+        elif len(still_unlabeled) == 1:
+            # Sole leftover: ensure not stuck on a now-named-only person id.
+            pass
+
+        _recalc_people(conn, list(touched))
+
+    return {"faces": len(rows), "moved": moved, "person_ids": ids}
+
+
 def photos_for_person(
     person_id: int, limit: int = 200, include_culled: bool = False
 ) -> list[dict[str, Any]]:
     # Aggregate first (one face + one photo per content), then join — avoids
     # correlated MIN() subqueries that scan the whole photos table per row.
-    culled_filter = "1=1" if include_culled else "p.culled = 0"
+    culled_filter = "p.missing = 0" if include_culled else "p.culled = 0 AND p.missing = 0"
     with db() as conn:
         rows = conn.execute(
             f"""
@@ -973,21 +1529,132 @@ def photos_for_person(
               p.culled, p.group_id, p.is_keeper, p.content_id,
               s.label AS source_label,
               c.file_hash, c.size, c.width, c.height, c.taken_at, c.camera,
-              c.lat, c.lon, c.city, c.region, c.country, c.place_label,
-              c.orientation, c.embedding_ready, c.faces_ready, c.indexed_at,
-              f.id AS face_id, f.bbox_x, f.bbox_y, f.bbox_w, f.bbox_h
+              c.lat, c.lon, c.gps, c.venue, c.city, c.region, c.country, c.place_label,
+              c.orientation, c.mirrored, c.embedding_ready, c.faces_ready, c.indexed_at,
+              f.id AS face_id, f.person_id, f.bbox_x, f.bbox_y, f.bbox_w, f.bbox_h,
+              pe.name AS person_name
             FROM keepers k
             JOIN photos p ON p.id = k.photo_id
             JOIN photo_contents c ON c.id = p.content_id
             JOIN sources s ON s.id = p.source_id
             JOIN person_faces pf ON pf.content_id = k.content_id
             JOIN faces f ON f.id = pf.face_id
+            LEFT JOIN people pe ON pe.id = f.person_id
             ORDER BY COALESCE(c.taken_at, '') DESC, p.id DESC
             LIMIT ?
             """,
             (person_id, limit),
         ).fetchall()
-    return [dict(r) for r in rows]
+    out = []
+    for r in rows:
+        d = dict(r)
+        name = (d.get("person_name") or "").strip() or None
+        d["labeled"] = is_person_labeled(name)
+        d["display_name"] = name or (
+            f"Person {d['person_id']}" if d.get("person_id") else "Unassigned"
+        )
+        out.append(d)
+    return out
+
+
+def photos_with_faces(
+    limit: int = 200,
+    include_culled: bool = False,
+    *,
+    labeled: bool | None = None,
+) -> list[dict[str, Any]]:
+    """All photos that have at least one face (primary People branch).
+
+    When ``labeled`` is True/False, only photos with a face belonging to a
+    labeled person (or unlabeled/Unknown) are included.
+
+    Each photo includes a ``faces`` list with every face bbox on that content.
+    """
+    culled_filter = "p.missing = 0" if include_culled else "p.culled = 0 AND p.missing = 0"
+    person_filter = ""
+    params: list[Any] = []
+    if labeled is not None:
+        ids = [int(p["id"]) for p in people_list(labeled=labeled)]
+        if not ids:
+            return []
+        placeholders = ",".join("?" * len(ids))
+        person_filter = f"AND f.person_id IN ({placeholders})"
+        params.extend(ids)
+    params.append(limit)
+    with db() as conn:
+        rows = conn.execute(
+            f"""
+            WITH faced AS (
+              SELECT DISTINCT f.content_id
+              FROM faces f
+              WHERE 1=1 {person_filter}
+            ),
+            keepers AS (
+              SELECT p.content_id, MIN(p.id) AS photo_id
+              FROM photos p
+              JOIN faced fd ON fd.content_id = p.content_id
+              WHERE {culled_filter}
+              GROUP BY p.content_id
+            )
+            SELECT
+              p.id, p.source_id, p.path, p.rel_path, p.mtime, p.album,
+              p.culled, p.group_id, p.is_keeper, p.content_id,
+              s.label AS source_label,
+              c.file_hash, c.size, c.width, c.height, c.taken_at, c.camera,
+              c.lat, c.lon, c.gps, c.venue, c.city, c.region, c.country, c.place_label,
+              c.orientation, c.mirrored, c.embedding_ready, c.faces_ready, c.indexed_at
+            FROM keepers k
+            JOIN photos p ON p.id = k.photo_id
+            JOIN photo_contents c ON c.id = p.content_id
+            JOIN sources s ON s.id = p.source_id
+            ORDER BY COALESCE(c.taken_at, '') DESC, p.id DESC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+        photos = [dict(r) for r in rows]
+        if not photos:
+            return []
+        content_ids = [int(p["content_id"]) for p in photos if p.get("content_id") is not None]
+        faces_by_content: dict[int, list[dict[str, Any]]] = {cid: [] for cid in content_ids}
+        if content_ids:
+            ph = ",".join("?" * len(content_ids))
+            for fr in conn.execute(
+                f"""
+                SELECT f.id, f.content_id, f.person_id,
+                       f.bbox_x, f.bbox_y, f.bbox_w, f.bbox_h,
+                       p.name AS person_name
+                FROM faces f
+                LEFT JOIN people p ON p.id = f.person_id
+                WHERE f.content_id IN ({ph})
+                ORDER BY f.id
+                """,
+                content_ids,
+            ).fetchall():
+                cid = int(fr["content_id"])
+                if cid not in faces_by_content:
+                    continue
+                name = (fr["person_name"] or "").strip() or None
+                # People-all gallery: only box named people (skip unlabeled / Unknown N).
+                if not is_person_labeled(name):
+                    continue
+                faces_by_content[cid].append(
+                    {
+                        "id": fr["id"],
+                        "person_id": fr["person_id"],
+                        "bbox_x": fr["bbox_x"],
+                        "bbox_y": fr["bbox_y"],
+                        "bbox_w": fr["bbox_w"],
+                        "bbox_h": fr["bbox_h"],
+                        "person_name": name,
+                        "display_name": name,
+                        "labeled": True,
+                    }
+                )
+        for p in photos:
+            cid = p.get("content_id")
+            p["faces"] = faces_by_content.get(int(cid), []) if cid is not None else []
+        return photos
 
 
 def faces_for_photo(photo_id: int) -> list[dict[str, Any]]:
@@ -1013,13 +1680,40 @@ def faces_for_photo(photo_id: int) -> list[dict[str, Any]]:
     out = []
     for r in rows:
         d = dict(r)
-        name = (d.get("person_name") or "").strip()
-        d["labeled"] = bool(name)
-        d["display_name"] = name or (
-            f"Person {d['person_id']}" if d.get("person_id") else "Unknown"
-        )
+        name = (d.get("person_name") or "").strip() or None
+        d["labeled"] = is_person_labeled(name)
+        if name:
+            d["display_name"] = name
+        elif d.get("person_id"):
+            d["display_name"] = f"Person {d['person_id']}"
+        else:
+            d["display_name"] = "Unassigned"
         out.append(d)
     return out
+
+
+def delete_face(face_id: int) -> dict[str, Any]:
+    """Remove a false-positive detection (dog, statue, cartoon, etc.)."""
+    fid = int(face_id)
+    with db() as conn:
+        row = conn.execute(
+            "SELECT id, person_id, content_id FROM faces WHERE id = ?", (fid,)
+        ).fetchone()
+        if not row:
+            raise ValueError(f"Face not found: {fid}")
+        person_id = row["person_id"]
+        conn.execute("DELETE FROM faces WHERE id = ?", (fid,))
+        if person_id is not None:
+            _recalc_people(conn, [int(person_id)])
+    try:
+        face_thumb_path(fid).unlink(missing_ok=True)
+    except OSError:
+        pass
+    return {
+        "ok": True,
+        "id": fid,
+        "person_id": int(person_id) if person_id is not None else None,
+    }
 
 
 def face_thumb_path(face_id: int) -> Path:

@@ -19,7 +19,11 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 def _culled_clause(include_culled: bool, alias: str = "") -> str:
     col = f"{alias}.culled" if alias else "culled"
-    return "1=1" if include_culled else f"{col} = 0"
+    miss = f"{alias}.missing" if alias else "missing"
+    live = f"{miss} = 0"
+    if include_culled:
+        return live
+    return f"{col} = 0 AND {live}"
 
 
 def _photos_by_ids(ids: list[int], include_culled: bool = False) -> dict[int, dict[str, Any]]:
@@ -51,7 +55,7 @@ def _one_photo_per_content(
               AND p.id = (
                 SELECT MIN(p2.id) FROM photos p2
                 WHERE p2.content_id = p.content_id
-                  AND {"1=1" if include_culled else "p2.culled = 0"}
+                  AND {"p2.missing = 0" if include_culled else "p2.culled = 0 AND p2.missing = 0"}
               )
             """,
             content_ids,
@@ -60,10 +64,69 @@ def _one_photo_per_content(
 
 
 def search_visual(
-    query: str, top_k: int = 48, include_culled: bool = False
+    query: str,
+    top_k: int = 48,
+    include_culled: bool = False,
+    content_ids: set[int] | None = None,
 ) -> list[dict[str, Any]]:
+    parts = [p.strip() for p in query.split("|") if p.strip()]
+    if len(parts) > 1:
+        best: dict[int, dict[str, Any]] = {}
+        for part in parts:
+            for item in search_visual(
+                part,
+                top_k=top_k,
+                include_culled=include_culled,
+                content_ids=content_ids,
+            ):
+                cid = int(item["content_id"])
+                if cid not in best or item["score"] > best[cid]["score"]:
+                    best[cid] = item
+        return sorted(best.values(), key=lambda x: -x["score"])[:top_k]
+
+    store = get_store()
+    fetch_k = top_k * 2
+    if content_ids is not None:
+        fetch_k = max(fetch_k, store.index.ntotal)
     vec = embed_text(query)
-    hits = get_store().search(vec, top_k=top_k * 2)
+    hits = store.search(vec, top_k=fetch_k)
+    if content_ids is not None:
+        hits = [(cid, score) for cid, score in hits if cid in content_ids]
+    return _hits_to_photos(hits, top_k=top_k, include_culled=include_culled)
+
+
+def search_similar(
+    content_id: int,
+    top_k: int = 48,
+    include_culled: bool = False,
+    content_ids: set[int] | None = None,
+) -> list[dict[str, Any]] | None:
+    """Rank photos by visual similarity to an already-embedded content id.
+
+    Returns None if the query content has no FAISS vector.
+    """
+    store = get_store()
+    vec = store.vector_for(content_id)
+    if vec is None:
+        return None
+    fetch_k = top_k + 1
+    if content_ids is not None:
+        fetch_k = max(fetch_k, store.index.ntotal)
+    hits = [
+        (cid, score)
+        for cid, score in store.search(vec, top_k=fetch_k)
+        if cid != content_id
+    ]
+    if content_ids is not None:
+        hits = [(cid, score) for cid, score in hits if cid in content_ids]
+    return _hits_to_photos(hits, top_k=top_k, include_culled=include_culled)
+
+
+def _hits_to_photos(
+    hits: list[tuple[int, float]],
+    top_k: int,
+    include_culled: bool = False,
+) -> list[dict[str, Any]]:
     by_content = _one_photo_per_content(
         [cid for cid, _ in hits], include_culled=include_culled
     )
@@ -94,18 +157,27 @@ def search_metadata(
     source_id: int | None = None,
     keepers_only: bool = False,
     include_culled: bool = False,
+    content_ids: set[int] | None = None,
     limit: int = 200,
 ) -> list[dict[str, Any]]:
     clauses = [_culled_clause(include_culled, "p")]
     params: list[Any] = []
 
+    if content_ids is not None:
+        if not content_ids:
+            return []
+        placeholders = ",".join("?" * len(content_ids))
+        clauses.append(f"c.id IN ({placeholders})")
+        params.extend(list(content_ids))
+
     if text:
         clauses.append(
             "(p.rel_path LIKE ? OR p.album LIKE ? OR c.camera LIKE ? OR p.path LIKE ? "
-            "OR c.city LIKE ? OR c.region LIKE ? OR c.country LIKE ? OR c.place_label LIKE ?)"
+            "OR c.city LIKE ? OR c.region LIKE ? OR c.country LIKE ? OR c.place_label LIKE ? "
+            "OR c.venue LIKE ?)"
         )
         like = f"%{text}%"
-        params.extend([like] * 8)
+        params.extend([like] * 9)
     if taken_from:
         clauses.append("c.taken_at >= ?")
         params.append(taken_from)
@@ -121,9 +193,10 @@ def search_metadata(
     if place:
         like = f"%{place}%"
         clauses.append(
-            "(c.city LIKE ? OR c.region LIKE ? OR c.country LIKE ? OR c.place_label LIKE ?)"
+            "(c.city LIKE ? OR c.region LIKE ? OR c.country LIKE ? OR c.place_label LIKE ? "
+            "OR c.venue LIKE ?)"
         )
-        params.extend([like, like, like, like])
+        params.extend([like, like, like, like, like])
     if source_id is not None:
         clauses.append("p.source_id = ?")
         params.append(source_id)
@@ -172,8 +245,14 @@ def hybrid_search(
     camera: str | None = None,
     source_id: int | None = None,
     include_culled: bool = False,
+    content_ids: set[int] | None = None,
 ) -> list[dict[str, Any]]:
-    visual = search_visual(query, top_k=top_k * 3, include_culled=include_culled)
+    visual = search_visual(
+        query,
+        top_k=top_k * 3,
+        include_culled=include_culled,
+        content_ids=content_ids,
+    )
     place_l = place.lower() if place else None
     out = []
     for item in visual:
@@ -189,7 +268,7 @@ def hybrid_search(
             continue
         if place_l:
             blob = " ".join(
-                str(item.get(k) or "") for k in ("city", "region", "country", "place_label")
+                str(item.get(k) or "") for k in ("venue", "city", "region", "country", "place_label")
             ).lower()
             if place_l not in blob:
                 continue
@@ -219,19 +298,19 @@ def suggest_places(q: str, limit: int = 12) -> list[dict[str, Any]]:
             SELECT label, kind, COUNT(*) AS count FROM (
                 SELECT c.city AS label, 'city' AS kind
                 FROM photos p JOIN photo_contents c ON c.id = p.content_id
-                WHERE p.culled = 0 AND c.city IS NOT NULL AND c.city != '' AND c.city LIKE ?
+                WHERE p.culled = 0 AND p.missing = 0 AND c.city IS NOT NULL AND c.city != '' AND c.city LIKE ?
                 UNION ALL
                 SELECT c.region AS label, 'region' AS kind
                 FROM photos p JOIN photo_contents c ON c.id = p.content_id
-                WHERE p.culled = 0 AND c.region IS NOT NULL AND c.region != '' AND c.region LIKE ?
+                WHERE p.culled = 0 AND p.missing = 0 AND c.region IS NOT NULL AND c.region != '' AND c.region LIKE ?
                 UNION ALL
                 SELECT c.country AS label, 'country' AS kind
                 FROM photos p JOIN photo_contents c ON c.id = p.content_id
-                WHERE p.culled = 0 AND c.country IS NOT NULL AND c.country != '' AND c.country LIKE ?
+                WHERE p.culled = 0 AND p.missing = 0 AND c.country IS NOT NULL AND c.country != '' AND c.country LIKE ?
                 UNION ALL
                 SELECT c.place_label AS label, 'place' AS kind
                 FROM photos p JOIN photo_contents c ON c.id = p.content_id
-                WHERE p.culled = 0 AND c.place_label IS NOT NULL AND c.place_label != ''
+                WHERE p.culled = 0 AND p.missing = 0 AND c.place_label IS NOT NULL AND c.place_label != ''
                   AND c.place_label LIKE ?
             )
             GROUP BY label, kind
@@ -252,7 +331,7 @@ def map_photos(include_culled: bool = False) -> list[dict[str, Any]]:
 
     # City-center pins for manually placed photos (cached Nominatim lookup).
     fill_missing_place_coords(fetch_limit=3)
-    culled = "" if include_culled else "AND p.culled = 0"
+    culled = "AND p.missing = 0" if include_culled else "AND p.culled = 0 AND p.missing = 0"
     with db() as conn:
         rows = conn.execute(
             f"""
@@ -268,7 +347,7 @@ def stats() -> dict[str, Any]:
     with db() as conn:
         return {
             "photos": conn.execute(
-                "SELECT COUNT(*) AS c FROM photos WHERE culled = 0"
+                "SELECT COUNT(*) AS c FROM photos WHERE culled = 0 AND missing = 0"
             ).fetchone()["c"],
             "culled": conn.execute(
                 "SELECT COUNT(*) AS c FROM photos WHERE culled = 1"
@@ -277,21 +356,21 @@ def stats() -> dict[str, Any]:
                 """
                 SELECT COUNT(*) AS c FROM photos p
                 JOIN photo_contents c ON c.id = p.content_id
-                WHERE c.embedding_ready = 1 AND p.culled = 0
+                WHERE c.embedding_ready = 1 AND p.culled = 0 AND p.missing = 0
                 """
             ).fetchone()["c"],
             "with_gps": conn.execute(
                 """
                 SELECT COUNT(*) AS c FROM photos p
                 JOIN photo_contents c ON c.id = p.content_id
-                WHERE c.lat IS NOT NULL AND p.culled = 0
+                WHERE c.lat IS NOT NULL AND p.culled = 0 AND p.missing = 0
                 """
             ).fetchone()["c"],
             "with_place": conn.execute(
                 """
                 SELECT COUNT(*) AS c FROM photos p
                 JOIN photo_contents c ON c.id = p.content_id
-                WHERE c.place_label IS NOT NULL AND p.culled = 0
+                WHERE c.place_label IS NOT NULL AND p.culled = 0 AND p.missing = 0
                 """
             ).fetchone()["c"],
             "sources": conn.execute(
@@ -299,7 +378,7 @@ def stats() -> dict[str, Any]:
             ).fetchone()["c"],
             "groups": conn.execute("SELECT COUNT(*) AS c FROM photo_groups").fetchone()["c"],
             "replicas": conn.execute(
-                "SELECT COUNT(*) AS c FROM photos WHERE is_keeper = 0 AND culled = 0 AND group_id IS NOT NULL"
+                "SELECT COUNT(*) AS c FROM photos WHERE is_keeper = 0 AND culled = 0 AND missing = 0 AND group_id IS NOT NULL"
             ).fetchone()["c"],
             "contents": conn.execute(
                 "SELECT COUNT(*) AS c FROM photo_contents"

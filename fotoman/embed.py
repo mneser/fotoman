@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from PIL import Image, ImageOps
+from PIL import Image, ImageFile, ImageOps
 from transformers import AutoModel, AutoProcessor
 
 from fotoman.config import load_settings
@@ -40,6 +40,8 @@ def _load_model():
 
 
 def _open_rgb(path: Path) -> Image.Image:
+    # Allow partial JPEGs (common in synced/export libraries) instead of aborting.
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
     im = Image.open(path)
     im = ImageOps.exif_transpose(im)
     return im.convert("RGB")

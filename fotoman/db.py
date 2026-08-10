@@ -19,11 +19,12 @@ _db_lock = threading.RLock()
 PHOTO_SELECT = """
 SELECT
   p.id, p.source_id, p.path, p.rel_path, p.mtime, p.album,
-  p.culled, p.group_id, p.is_keeper, p.content_id,
+  p.culled, p.missing, p.group_id, p.is_keeper, p.content_id,
   s.label AS source_label,
   c.file_hash, c.size, c.width, c.height, c.taken_at, c.camera,
-  c.lat, c.lon, c.city, c.region, c.country, c.place_label,
-  c.orientation, c.fingerprint, c.embedding_ready, c.faces_ready, c.indexed_at
+  c.lat, c.lon, c.gps, c.venue, c.city, c.region, c.country, c.place_label,
+  c.orientation, c.mirrored, c.fingerprint, c.sharpness, c.exposure, c.quality,
+  c.embedding_ready, c.faces_ready, c.indexed_at
 FROM photos p
 JOIN photo_contents c ON c.id = p.content_id
 JOIN sources s ON s.id = p.source_id
@@ -51,17 +52,25 @@ CREATE TABLE IF NOT EXISTS photo_contents (
     width INTEGER,
     height INTEGER,
     taken_at TEXT,
+    taken_at_source TEXT,
     camera TEXT,
     lat REAL,
     lon REAL,
+    gps INTEGER NOT NULL DEFAULT 0,
+    venue TEXT,
     city TEXT,
     region TEXT,
     country TEXT,
     place_label TEXT,
     orientation INTEGER NOT NULL DEFAULT 0,
+    mirrored INTEGER NOT NULL DEFAULT 0,
     fingerprint TEXT,
+    sharpness REAL,
+    exposure REAL,
+    quality REAL,
     embedding_ready INTEGER NOT NULL DEFAULT 0,
     faces_ready INTEGER NOT NULL DEFAULT 0,
+    near_edges_ready INTEGER NOT NULL DEFAULT 0,
     indexed_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -81,6 +90,7 @@ CREATE TABLE IF NOT EXISTS photos (
     mtime REAL,
     album TEXT,
     culled INTEGER NOT NULL DEFAULT 0,
+    missing INTEGER NOT NULL DEFAULT 0,
     group_id INTEGER,
     is_keeper INTEGER NOT NULL DEFAULT 1,
     UNIQUE(source_id, path)
@@ -99,14 +109,36 @@ CREATE TABLE IF NOT EXISTS photo_groups (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Loosest near-dup graph (content-level). Regroup filters by slider threshold.
+CREATE TABLE IF NOT EXISTS content_near_edges (
+    content_a INTEGER NOT NULL REFERENCES photo_contents(id) ON DELETE CASCADE,
+    content_b INTEGER NOT NULL REFERENCES photo_contents(id) ON DELETE CASCADE,
+    score REAL NOT NULL,
+    PRIMARY KEY (content_a, content_b),
+    CHECK (content_a < content_b)
+);
+CREATE INDEX IF NOT EXISTS idx_near_edges_b ON content_near_edges(content_b);
+
 CREATE TABLE IF NOT EXISTS place_geo_cache (
     query TEXT PRIMARY KEY,
     city TEXT NOT NULL,
     country TEXT NOT NULL,
+    region TEXT,
+    display_name TEXT,
     lat REAL,
     lon REAL,
     found INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS place_geo_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    query TEXT NOT NULL UNIQUE,
+    kind TEXT NOT NULL DEFAULT 'city',
+    city TEXT,
+    region TEXT,
+    country TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS index_job (
@@ -149,6 +181,24 @@ CREATE TABLE IF NOT EXISTS faces (
 
 CREATE INDEX IF NOT EXISTS idx_faces_content ON faces(content_id);
 CREATE INDEX IF NOT EXISTS idx_faces_person ON faces(person_id);
+
+CREATE TABLE IF NOT EXISTS virtual_folders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_virtual_folders_name_unique
+ON virtual_folders(lower(trim(name)));
+
+CREATE TABLE IF NOT EXISTS virtual_folder_members (
+    folder_id INTEGER NOT NULL REFERENCES virtual_folders(id) ON DELETE CASCADE,
+    content_id INTEGER NOT NULL REFERENCES photo_contents(id) ON DELETE CASCADE,
+    added_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (folder_id, content_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vfolder_members_content ON virtual_folder_members(content_id);
 """
 
 
@@ -278,12 +328,68 @@ def _ensure_source_columns(conn: sqlite3.Connection) -> None:
             """
         )
     pc_cols = _columns(conn, "photo_contents") if _table_exists(conn, "photo_contents") else set()
+    photo_cols = _columns(conn, "photos") if _table_exists(conn, "photos") else set()
+    if photo_cols and "missing" not in photo_cols:
+        conn.execute(
+            "ALTER TABLE photos ADD COLUMN missing INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_photos_missing ON photos(missing)"
+        )
     if pc_cols and "fingerprint" not in pc_cols:
         conn.execute("ALTER TABLE photo_contents ADD COLUMN fingerprint TEXT")
+    if pc_cols and "near_edges_ready" not in pc_cols:
+        conn.execute(
+            "ALTER TABLE photo_contents ADD COLUMN near_edges_ready INTEGER NOT NULL DEFAULT 0"
+        )
     if pc_cols and "orientation" not in pc_cols:
         conn.execute(
             "ALTER TABLE photo_contents ADD COLUMN orientation INTEGER NOT NULL DEFAULT 0"
         )
+    if pc_cols and "mirrored" not in pc_cols:
+        conn.execute(
+            "ALTER TABLE photo_contents ADD COLUMN mirrored INTEGER NOT NULL DEFAULT 0"
+        )
+    if pc_cols and "gps" not in pc_cols:
+        # One-shot: add provenance flag, drop invented coords/places, force EXIF re-read.
+        conn.execute(
+            "ALTER TABLE photo_contents ADD COLUMN gps INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.execute(
+            """
+            UPDATE photo_contents SET
+                lat = NULL, lon = NULL, gps = 0,
+                city = NULL, region = NULL, country = NULL, place_label = NULL,
+                width = NULL
+            """
+        )
+        conn.execute(
+            """
+            DELETE FROM place_geo_cache
+            WHERE lower(query) LIKE 'freeform|trash%'
+               OR lower(query) LIKE 'freeform|shared%'
+            """
+        )
+    pc_cols = _columns(conn, "photo_contents") if _table_exists(conn, "photo_contents") else set()
+    if pc_cols and "venue" not in pc_cols:
+        conn.execute("ALTER TABLE photo_contents ADD COLUMN venue TEXT")
+    if pc_cols and "sharpness" not in pc_cols:
+        conn.execute("ALTER TABLE photo_contents ADD COLUMN sharpness REAL")
+    if pc_cols and "exposure" not in pc_cols:
+        conn.execute("ALTER TABLE photo_contents ADD COLUMN exposure REAL")
+    if pc_cols and "quality" not in pc_cols:
+        conn.execute("ALTER TABLE photo_contents ADD COLUMN quality REAL")
+    if pc_cols and "taken_at_source" not in pc_cols:
+        conn.execute("ALTER TABLE photo_contents ADD COLUMN taken_at_source TEXT")
+        # Existing dated rows were EXIF (or manual without provenance); leave NULL
+        # so backfill does not overwrite them with filename/mtime.
+    cache_cols = (
+        _columns(conn, "place_geo_cache") if _table_exists(conn, "place_geo_cache") else set()
+    )
+    if cache_cols and "region" not in cache_cols:
+        conn.execute("ALTER TABLE place_geo_cache ADD COLUMN region TEXT")
+    if cache_cols and "display_name" not in cache_cols:
+        conn.execute("ALTER TABLE place_geo_cache ADD COLUMN display_name TEXT")
     job_cols = _columns(conn, "index_job") if _table_exists(conn, "index_job") else set()
     if job_cols and "source_id" not in job_cols:
         conn.execute("ALTER TABLE index_job ADD COLUMN source_id INTEGER")
@@ -300,6 +406,7 @@ def _pick_better_content(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]
         "camera",
         "lat",
         "lon",
+        "venue",
         "city",
         "region",
         "country",
@@ -505,8 +612,9 @@ def _migrate_legacy_photos_to_contents(conn: sqlite3.Connection) -> bool:
             """
             CREATE TABLE faces_new (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                content_id INTEGER NOT NULL,
-                person_id INTEGER,
+                content_id INTEGER NOT NULL
+                    REFERENCES photo_contents(id) ON DELETE CASCADE,
+                person_id INTEGER REFERENCES people(id) ON DELETE SET NULL,
                 bbox_x REAL NOT NULL,
                 bbox_y REAL NOT NULL,
                 bbox_w REAL NOT NULL,
@@ -758,6 +866,110 @@ def _migrate_photos_multi_archive(conn: sqlite3.Connection) -> bool:
     return True
 
 
+def _faces_has_person_fk(conn: sqlite3.Connection) -> bool:
+    if not _table_exists(conn, "faces"):
+        return True
+    for fk in conn.execute("PRAGMA foreign_key_list(faces)"):
+        if fk["table"] == "people" and fk["from"] == "person_id":
+            return True
+    return False
+
+
+def _repair_orphan_face_people(conn: sqlite3.Connection) -> int:
+    """Reattach faces whose person_id is missing (keeps shared ids together)."""
+    if not _table_exists(conn, "faces") or not _table_exists(conn, "people"):
+        return 0
+    orphans = conn.execute(
+        """
+        SELECT f.id, f.person_id
+        FROM faces f
+        LEFT JOIN people p ON p.id = f.person_id
+        WHERE p.id IS NULL
+        """
+    ).fetchall()
+    if not orphans:
+        return 0
+    by_old: dict[int | None, list[int]] = {}
+    for r in orphans:
+        key = int(r["person_id"]) if r["person_id"] is not None else None
+        by_old.setdefault(key, []).append(int(r["id"]))
+    fixed = 0
+    for old_pid, face_ids in by_old.items():
+        if old_pid is None:
+            for fid in face_ids:
+                cur = conn.execute(
+                    "INSERT INTO people (name, face_count) VALUES (NULL, 1)"
+                )
+                conn.execute(
+                    "UPDATE faces SET person_id = ? WHERE id = ?",
+                    (int(cur.lastrowid), fid),
+                )
+                fixed += 1
+            continue
+        cur = conn.execute(
+            "INSERT INTO people (name, face_count) VALUES (NULL, ?)",
+            (len(face_ids),),
+        )
+        new_pid = int(cur.lastrowid)
+        conn.executemany(
+            "UPDATE faces SET person_id = ? WHERE id = ?",
+            [(new_pid, fid) for fid in face_ids],
+        )
+        fixed += len(face_ids)
+    return fixed
+
+
+def _ensure_faces_foreign_keys(conn: sqlite3.Connection) -> None:
+    """Restore FKs dropped by the content-migration faces rebuild.
+
+    Without people ON DELETE SET NULL, deleting empty people can leave
+    faces pointing at missing person ids (labeling then fails).
+    """
+    if not _table_exists(conn, "faces") or _faces_has_person_fk(conn):
+        return
+    _repair_orphan_face_people(conn)
+    # Drop faces that reference missing content (cannot satisfy FK).
+    conn.execute(
+        """
+        DELETE FROM faces
+        WHERE content_id NOT IN (SELECT id FROM photo_contents)
+        """
+    )
+    conn.execute("PRAGMA foreign_keys = OFF")
+    conn.execute(
+        """
+        CREATE TABLE faces_fk (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            content_id INTEGER NOT NULL REFERENCES photo_contents(id) ON DELETE CASCADE,
+            person_id INTEGER REFERENCES people(id) ON DELETE SET NULL,
+            bbox_x REAL NOT NULL,
+            bbox_y REAL NOT NULL,
+            bbox_w REAL NOT NULL,
+            bbox_h REAL NOT NULL,
+            det_score REAL,
+            embedding BLOB,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO faces_fk(
+            id, content_id, person_id, bbox_x, bbox_y, bbox_w, bbox_h,
+            det_score, embedding, created_at
+        )
+        SELECT id, content_id, person_id, bbox_x, bbox_y, bbox_w, bbox_h,
+               det_score, embedding, created_at
+        FROM faces
+        """
+    )
+    conn.execute("DROP TABLE faces")
+    conn.execute("ALTER TABLE faces_fk RENAME TO faces")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_faces_content ON faces(content_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_faces_person ON faces(person_id)")
+    conn.execute("PRAGMA foreign_keys = ON")
+
+
 def _ensure_content_indexes(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_contents_hash ON photo_contents(file_hash)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_contents_taken ON photo_contents(taken_at)")
@@ -765,9 +977,28 @@ def _ensure_content_indexes(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_contents_place ON photo_contents(place_label)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_contents_embed ON photo_contents(embedding_ready)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_contents_faces ON photo_contents(faces_ready)")
+    if "near_edges_ready" in _columns(conn, "photo_contents"):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_contents_near_edges ON photo_contents(near_edges_ready)"
+        )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS content_near_edges (
+            content_a INTEGER NOT NULL REFERENCES photo_contents(id) ON DELETE CASCADE,
+            content_b INTEGER NOT NULL REFERENCES photo_contents(id) ON DELETE CASCADE,
+            score REAL NOT NULL,
+            PRIMARY KEY (content_a, content_b),
+            CHECK (content_a < content_b)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_near_edges_b ON content_near_edges(content_b)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_content ON photos(content_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_source ON photos(source_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_path ON photos(path)")
+    # Only after _ensure_source_columns has added photos.missing on older DBs.
+    if "missing" in _columns(conn, "photos"):
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_missing ON photos(missing)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_faces_content ON faces(content_id)")
 
 
@@ -776,13 +1007,38 @@ def _clear_null_island_gps(conn: sqlite3.Connection) -> int:
     cur = conn.execute(
         """
         UPDATE photo_contents
-        SET lat = NULL, lon = NULL,
-            city = NULL, region = NULL, country = NULL, place_label = NULL
+        SET lat = NULL, lon = NULL, gps = 0,
+            venue = NULL, city = NULL, region = NULL, country = NULL, place_label = NULL
         WHERE lat IS NOT NULL AND lon IS NOT NULL
           AND ABS(lat) < 1e-5 AND ABS(lon) < 1e-5
         """
     )
     return int(cur.rowcount or 0)
+
+
+def _purge_orphan_photos(conn: sqlite3.Connection) -> int:
+    """Delete location rows whose archive no longer exists.
+
+    Past migrations dropped ``photos.source_id`` FK CASCADE, so removing an
+    archive could leave dangling rows that inflate Places counts.
+    """
+    if not _table_exists(conn, "photos") or not _table_exists(conn, "sources"):
+        return 0
+    rows = conn.execute(
+        """
+        SELECT p.id, p.content_id
+        FROM photos p
+        LEFT JOIN sources s ON s.id = p.source_id
+        WHERE s.id IS NULL
+        """
+    ).fetchall()
+    if not rows:
+        return 0
+    conn.executemany(
+        "DELETE FROM photos WHERE id = ?", [(int(r["id"]),) for r in rows]
+    )
+    # Keep photo_contents / embeddings even with no locations (content vault).
+    return len(rows)
 
 
 def init_db() -> None:
@@ -800,11 +1056,19 @@ def init_db() -> None:
         multi_archive = _migrate_photos_multi_archive(conn)
         _ensure_source_columns(conn)
         _ensure_people_name_unique(conn)
+        _ensure_faces_foreign_keys(conn)
         _ensure_content_indexes(conn)
         _clear_null_island_gps(conn)
-        from fotoman.geocode import normalize_freeform_places
+        _purge_orphan_photos(conn)
+        from fotoman.geocode import (
+            normalize_freeform_places,
+            normalize_place_structure,
+            normalize_quebec_province,
+        )
 
         normalize_freeform_places(conn)
+        normalize_place_structure(conn)
+        normalize_quebec_province(conn)
         conn.execute(
             """
             INSERT OR IGNORE INTO index_job(id, running, phase, current, total, message, error, reembed)
@@ -902,13 +1166,22 @@ def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
 
 
 def gc_orphaned_content(conn: sqlite3.Connection, content_id: int) -> None:
-    """Delete content (and faces/thumb/FAISS) when no locations remain."""
+    """Explicitly delete content (faces/thumb/FAISS) when no locations remain.
+
+    Not used by scan/archive-remove — content is retained as a durable vault
+    so moves and remounts can hash-link without re-embedding. Call only from
+    intentional purge paths.
+    """
     n = conn.execute(
         "SELECT COUNT(*) AS c FROM photos WHERE content_id = ?", (content_id,)
     ).fetchone()["c"]
     if n:
         return
     conn.execute("DELETE FROM faces WHERE content_id = ?", (content_id,))
+    conn.execute(
+        "DELETE FROM content_near_edges WHERE content_a = ? OR content_b = ?",
+        (content_id, content_id),
+    )
     conn.execute("DELETE FROM photo_contents WHERE id = ?", (content_id,))
     content_thumb_path(content_id).unlink(missing_ok=True)
     try:
@@ -919,3 +1192,22 @@ def gc_orphaned_content(conn: sqlite3.Connection, content_id: int) -> None:
         store.save()
     except Exception:
         pass
+
+
+def purge_orphaned_contents() -> int:
+    """Drop content rows with zero location references (thumbs, faces, FAISS)."""
+    purged = 0
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT c.id
+            FROM photo_contents c
+            WHERE NOT EXISTS (
+              SELECT 1 FROM photos p WHERE p.content_id = c.id
+            )
+            """
+        ).fetchall()
+        for r in rows:
+            gc_orphaned_content(conn, int(r["id"]))
+            purged += 1
+    return purged

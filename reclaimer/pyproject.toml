@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reclaim"
+version = "0.1.0"
+description = "Pull photos off Google / Facebook / Instagram into a Fotoman-ready folder"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Fotoman / Reclaimer" }]
+dependencies = [
+  "typer>=0.12.0",
+  "rich>=13.0.0,<14",
+  "google-auth>=2.29.0",
+  "google-auth-oauthlib>=1.2.0",
+  "google-api-python-client>=2.130.0",
+  "httpx>=0.27.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+reclaim = "reclaim.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["reclaim*"]
