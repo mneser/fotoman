@@ -1,7 +1,11 @@
 .venv/
 __pycache__/
 *.pyc
+# Runtime library + models live outside the repo (XDG / FOTOMAN_DATA / FOTOMAN_CACHE).
 data/
 *.egg-info/
 .pytest_cache/
 .DS_Store
+build/
+dist/
+node_modules/

@@ -1,5 +1,24 @@
 const $ = (sel) => document.querySelector(sel);
 
+function loadingMarkup(label = "Loading", size = "") {
+  // Default matches the regroup/recluster busy-mark; sm/inline are compact.
+  if (!size) {
+    return `<div class="busy-mark" role="status" aria-label="${label}">
+    <img class="busy-mark-img" src="/fotoman.png" alt="" draggable="false" />
+    <div class="busy-spinner" aria-hidden="true">
+      <img src="/fotoman.png" alt="" draggable="false" />
+    </div>
+  </div>`;
+  }
+  const sizeClass = ` loading-mark-${size}`;
+  return `<div class="loading-mark${sizeClass}" role="status" aria-label="${label}">
+    <img class="loading-mark-img" src="/fotoman.png" alt="" draggable="false" />
+    <div class="busy-spinner" aria-hidden="true">
+      <img src="/fotoman.png" alt="" draggable="false" />
+    </div>
+  </div>`;
+}
+
 async function api(path, opts = {}) {
   const res = await fetch(path, {
     headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
@@ -57,6 +76,210 @@ function setLightboxTransform(deg, mirrored = false) {
   stage.style.transform = parts.join(" ") || "";
 }
 
+const LIGHTBOX_ZOOM_MIN = 1;
+const LIGHTBOX_ZOOM_MAX = 8;
+const VQA_KEY_MASK = "••••••••";
+let lightboxZoom = 1;
+let lightboxPanX = 0;
+let lightboxPanY = 0;
+let lightboxPanDrag = null;
+
+function lightboxZoomLayout() {
+  const img = $("#lightbox-img");
+  const stage = img?.closest(".lightbox-stage");
+  const wrap = stage?.closest(".lightbox-stage-wrap");
+  if (!img || !stage || !wrap) return null;
+  const nw = img.naturalWidth;
+  const nh = img.naturalHeight;
+  const ww = wrap.clientWidth;
+  const wh = wrap.clientHeight;
+  if (!nw || !nh || !ww || !wh) return null;
+  const contain = Math.min(ww / nw, wh / nh);
+  const cover = Math.max(ww / nw, wh / nh);
+  const zoomed = lightboxZoom > 1.001;
+  // Continuous zoom from contain; past cover/contain the long axis crops.
+  const fit = contain * lightboxZoom;
+  return {
+    img,
+    stage,
+    wrap,
+    nw,
+    nh,
+    ww,
+    wh,
+    contain,
+    cover,
+    fit,
+    zoomed,
+    iw: nw * fit,
+    ih: nh * fit,
+  };
+}
+
+function clampLightboxPan(layout = lightboxZoomLayout()) {
+  if (!layout?.zoomed) {
+    lightboxPanX = 0;
+    lightboxPanY = 0;
+    return;
+  }
+  const maxX = Math.max(0, (layout.iw - layout.ww) / 2);
+  const maxY = Math.max(0, (layout.ih - layout.wh) / 2);
+  lightboxPanX = Math.max(-maxX, Math.min(maxX, lightboxPanX));
+  lightboxPanY = Math.max(-maxY, Math.min(maxY, lightboxPanY));
+}
+
+function applyLightboxZoomPan() {
+  const layout = lightboxZoomLayout();
+  const img = layout?.img || $("#lightbox-img");
+  const faces = $("#lightbox-faces");
+  const stage = layout?.stage || img?.closest(".lightbox-stage");
+  const zoomed = !!layout?.zoomed;
+  if (layout) clampLightboxPan(layout);
+  if (img) {
+    if (zoomed && layout) {
+      img.style.width = `${layout.iw}px`;
+      img.style.height = `${layout.ih}px`;
+      img.style.maxWidth = "none";
+      img.style.maxHeight = "none";
+      img.style.transform = `translate(${lightboxPanX}px, ${lightboxPanY}px)`;
+    } else {
+      img.style.width = "";
+      img.style.height = "";
+      img.style.maxWidth = "";
+      img.style.maxHeight = "";
+      img.style.transform = "";
+    }
+  }
+  if (faces) {
+    if (zoomed && layout && img) {
+      faces.style.width = `${layout.iw}px`;
+      faces.style.height = `${layout.ih}px`;
+      faces.style.left = `${img.offsetLeft}px`;
+      faces.style.top = `${img.offsetTop}px`;
+      faces.style.right = "auto";
+      faces.style.bottom = "auto";
+      faces.style.marginLeft = "";
+      faces.style.marginTop = "";
+      faces.style.transform = `translate(${lightboxPanX}px, ${lightboxPanY}px)`;
+    } else {
+      faces.style.transform = "";
+      faces.style.right = "";
+      faces.style.bottom = "";
+      faces.style.marginLeft = "";
+      faces.style.marginTop = "";
+      if (img && !faces.hidden) syncLightboxFaceLayer(faces, img);
+      else {
+        faces.style.width = "";
+        faces.style.height = "";
+        faces.style.left = "";
+        faces.style.top = "";
+      }
+    }
+  }
+  if (stage) {
+    stage.classList.toggle("is-zoomed", zoomed);
+    stage.classList.toggle("is-panning", !!lightboxPanDrag);
+  }
+  syncLightboxZoomHud(layout);
+}
+
+function formatLightboxZoomScale(z) {
+  const rounded = Math.round(z * 10) / 10;
+  return Number.isInteger(rounded) ? `${rounded}×` : `${rounded.toFixed(1)}×`;
+}
+
+function syncLightboxZoomHud(layout = lightboxZoomLayout()) {
+  const hud = $("#lightbox-zoom-hud");
+  const scaleEl = $("#lightbox-zoom-scale");
+  const thumb = $("#lightbox-zoom-thumb");
+  const roi = $("#lightbox-zoom-roi");
+  const img = layout?.img || $("#lightbox-img");
+  const stage = layout?.stage || img?.closest(".lightbox-stage");
+  if (!hud || !scaleEl || !thumb || !roi || !img || !stage) return;
+
+  const zoomed = !!layout?.zoomed;
+  hud.hidden = !zoomed;
+  if (!zoomed || !layout) return;
+
+  const wrap = layout.wrap;
+  if (wrap) {
+    const sr = stage.getBoundingClientRect();
+    const wr = wrap.getBoundingClientRect();
+    hud.style.left = `${Math.max(0, sr.left - wr.left) + 8}px`;
+    hud.style.top = `${Math.max(0, sr.top - wr.top) + 8}px`;
+  }
+
+  scaleEl.textContent = formatLightboxZoomScale(lightboxZoom);
+  if (thumb.getAttribute("src") !== img.getAttribute("src")) {
+    thumb.src = img.currentSrc || img.src || "";
+  }
+
+  const { iw, ih, ww: sw, wh: sh } = layout;
+  if (!iw || !ih || !sw || !sh) return;
+
+  const left = (iw / 2 + (-sw / 2 - lightboxPanX)) / iw;
+  const top = (ih / 2 + (-sh / 2 - lightboxPanY)) / ih;
+  const width = sw / iw;
+  const height = sh / ih;
+  const x0 = Math.max(0, Math.min(1, left));
+  const y0 = Math.max(0, Math.min(1, top));
+  const x1 = Math.max(0, Math.min(1, left + width));
+  const y1 = Math.max(0, Math.min(1, top + height));
+  roi.style.left = `${x0 * 100}%`;
+  roi.style.top = `${y0 * 100}%`;
+  roi.style.width = `${Math.max(0.02, x1 - x0) * 100}%`;
+  roi.style.height = `${Math.max(0.02, y1 - y0) * 100}%`;
+}
+
+function resetLightboxZoomPan() {
+  lightboxZoom = 1;
+  lightboxPanX = 0;
+  lightboxPanY = 0;
+  lightboxPanDrag = null;
+  applyLightboxZoomPan();
+}
+
+function lightboxPanToNorm(nx, ny) {
+  const layout = lightboxZoomLayout();
+  if (!layout?.zoomed) return;
+  const x = Math.max(0, Math.min(1, nx));
+  const y = Math.max(0, Math.min(1, ny));
+  lightboxPanX = -(x - 0.5) * layout.iw;
+  lightboxPanY = -(y - 0.5) * layout.ih;
+  applyLightboxZoomPan();
+}
+
+function lightboxZoomNavNormFromEvent(e, nav) {
+  const rect = nav.getBoundingClientRect();
+  if (!rect.width || !rect.height) return null;
+  return {
+    x: (e.clientX - rect.left) / rect.width,
+    y: (e.clientY - rect.top) / rect.height,
+  };
+}
+
+function lightboxZoomAt(clientX, clientY, nextZoom) {
+  const prev = lightboxZoomLayout();
+  if (!prev) return;
+  const z = Math.min(LIGHTBOX_ZOOM_MAX, Math.max(LIGHTBOX_ZOOM_MIN, nextZoom));
+  if (z <= LIGHTBOX_ZOOM_MIN) {
+    resetLightboxZoomPan();
+    return;
+  }
+  const rect = prev.stage.getBoundingClientRect();
+  const cx = clientX - rect.left - rect.width / 2;
+  const cy = clientY - rect.top - rect.height / 2;
+  const prevFit = prev.zoomed ? prev.fit : prev.contain;
+  const contentX = (cx - lightboxPanX) / prevFit;
+  const contentY = (cy - lightboxPanY) / prevFit;
+  lightboxZoom = z;
+  const next = lightboxZoomLayout();
+  if (!next) return;
+  lightboxPanX = cx - contentX * next.fit;
+  lightboxPanY = cy - contentY * next.fit;
+  applyLightboxZoomPan();
+}
+
 async function refreshStats() {
   const s = await api("/api/stats");
   $("#stats").textContent = `${s.photos} photos · ${s.embedded} embedded`;
@@ -87,11 +310,8 @@ async function deletePhotoIds(ids) {
 }
 
 function ensureBrowseGalleryVisible() {
-  const view = GALLERY_WORKSPACE_VIEWS.has(browseGalleryView)
-    ? browseGalleryView
-    : "thumbs";
-  browseGalleryView = view;
-  activateTab("browse", { workspaceView: view });
+  browseGalleryView = "thumbs";
+  activateTab("browse", { workspaceView: "stack" });
 }
 
 function restoreBrowseGalleryFromSearch() {
@@ -286,6 +506,22 @@ function archiveFacesGoEnabled(sourceId, fst, source) {
 }
 
 function formatSourceCounts(s) {
+  const isBackup = String(s.kind || "watched") === "backup";
+  if (isBackup) {
+    const copied = Number(s.backup_copied_count ?? s.photo_count ?? 0);
+    const pending = Number(s.backup_pending_count || 0);
+    const extra = Number(s.backup_extra_count || 0);
+    const parts = [`${copied} copied`];
+    if (pending > 0) {
+      parts.push(
+        `<span class="source-count-progress">${pending} pending</span>`
+      );
+    } else if (copied > 0) {
+      parts.push(`in sync <span class="source-count-done" title="done">✓</span>`);
+    }
+    if (extra > 0) parts.push(`${extra} extra`);
+    return parts.join(" · ");
+  }
   const listed = Number(s.listed_count || 0);
   const indexed = Number(s.photo_count ?? 0);
   const faces = Number(s.faces_ready_count ?? 0);
@@ -298,7 +534,7 @@ function formatSourceCounts(s) {
   const indexedDone = indexed > 0 && (listed <= 0 || indexed >= listed);
   parts.push(formatSourceStage("indexed", indexed, indexedDone));
   parts.push(
-    formatSourceStage("face-scanned", faces, indexed > 0 && pendingFaces === 0)
+    formatSourceStage("facematched", faces, indexed > 0 && pendingFaces === 0)
   );
   parts.push(
     formatSourceStage("embedded", embedded, indexed > 0 && pendingEmbed === 0)
@@ -325,18 +561,22 @@ function toGoLabel(n) {
 }
 
 const INDEX_STAGES = [
-  { id: "index", label: "Indexing", slow: true },
-  { id: "geocode", label: "Geocoding", slow: true },
-  { id: "grayscale", label: "Fingerprinting", slow: true },
+  { id: "unpack", label: "Unpack", slow: true },
+  { id: "index", label: "Index", slow: true },
+  { id: "sync", label: "Sync", slow: true },
+  { id: "geocode", label: "Geocode", slow: true },
+  { id: "grayscale", label: "Fingerprint", slow: true },
   { id: "faces", label: "Facematch", slow: false },
-  { id: "embed", label: "Embedding", slow: true },
-  { id: "clustering", label: "Clustering", slow: true },
+  { id: "embed", label: "Embed", slow: true },
+  { id: "clustering", label: "Cluster", slow: true },
 ];
 
 function stageOrder(phase) {
+  if (phase === "unpack") return "unpack";
   if (phase === "starting" || phase === "scan" || phase === "list" || phase === "index") {
     return "index";
   }
+  if (phase === "sync") return "sync";
   if (
     phase === "geocode" ||
     phase === "grayscale" ||
@@ -378,14 +618,19 @@ function renderIndexStages(st, fst) {
   if (!root) return;
   const faceSt = fst || lastFacesStatus;
   const phase = st?.phase || "idle";
-  const running = !!st?.running;
+  const unpacking = !!st?.import?.running;
+  const running = !!st?.running || unpacking;
   const suspended = !!st?.embed_suspended || phase === "suspended";
-  const active = running ? stageOrder(phase) : null;
+  const active = unpacking ? "unpack" : running ? stageOrder(phase) : null;
   const pipeline = INDEX_STAGES.filter((s) => s.id !== "faces");
   const activeIdx = active ? pipeline.findIndex((s) => s.id === active) : -1;
   const pendingEmbed = pendingEmbedCount(st);
   const pendingFaces = pendingFacesCount();
   const faceRunning = !!faceSt?.running && faceSt.phase !== "suspended";
+  const unpackLeft = Math.max(
+    0,
+    Number(st?.import?.total || 0) - Number(st?.import?.extracted || 0)
+  );
 
   const items = INDEX_STAGES.map((s) => {
     let cls = "";
@@ -393,7 +638,16 @@ function renderIndexStages(st, fst) {
     let title = s.label;
     const pipeIdx = pipeline.findIndex((p) => p.id === s.id);
 
-    if (s.id === "faces") {
+    if (s.id === "unpack") {
+      if (unpacking) {
+        cls = "is-active";
+        title = "Unpack now";
+        if (unpackLeft > 0) count = toGoLabel(unpackLeft);
+      } else if (running && activeIdx > 0) {
+        cls = "is-done";
+        title = "Unpack done";
+      }
+    } else if (s.id === "faces") {
       if (pendingFaces > 0) count = toGoLabel(pendingFaces);
       const facesQueued = Number(faceSt?.queued_count || 0) > 0;
       if (faceRunning) {
@@ -404,25 +658,22 @@ function renderIndexStages(st, fst) {
         cls = "is-waiting";
         title = "Facematch scheduled";
       }
-      // Facematch disabled → pendingFaces is 0 → grey
     } else if (s.id === "embed") {
       if (pendingEmbed > 0) count = toGoLabel(pendingEmbed);
       if (running && active === "embed") {
         cls = "is-active";
-        title = "Embedding now";
+        title = "Embed now";
         count = toGoLabel(remainingCount(st)) || count;
       } else if (pendingEmbed > 0 && running) {
         cls = "is-waiting";
-        title = "Embedding scheduled next";
+        title = "Embed scheduled next";
       } else if (pendingEmbed > 0) {
-        // Embed still enabled with leftover work, but indexer idle.
         cls = "is-waiting";
-        title = "Embedding has work left";
+        title = "Embed has work left";
       } else if (running && activeIdx >= 0 && pipeIdx < activeIdx) {
         cls = "is-done";
-        title = "Embedding caught up";
+        title = "Embed caught up";
       }
-      // Embed disabled → pendingEmbed is 0 → grey idle (no pill highlight)
     } else if (running && s.id === active) {
       cls = "is-active";
       count = toGoLabel(remainingCount(st));
@@ -434,8 +685,6 @@ function renderIndexStages(st, fst) {
       cls = "is-done";
       title = `${s.label} done`;
     }
-    // Do not mark later stages orange just because they are "next" — that lit
-    // Fingerprinting while it had nothing left to do.
 
     return `<li class="${cls}" data-stage="${s.id}" title="${title}"><span class="stage-label">${s.label}</span>${
       count ? `<span class="stage-count">${count}</span>` : ""
@@ -445,37 +694,55 @@ function renderIndexStages(st, fst) {
   root.innerHTML = items.join('<li class="index-stage-sep" aria-hidden="true">→</li>');
 }
 
+function sourceCheckCell(attr, id, on, { disabled = false, available = true } = {}) {
+  if (!available) return `<td class="source-col-check"></td>`;
+  return `<td class="source-col-check"><label class="source-check"><input type="checkbox" data-${attr}="${id}" ${on ? "checked" : ""} ${disabled ? "disabled" : ""} /></label></td>`;
+}
+
+const SOURCE_REFRESH_SVG = `<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 6V1L7 6l5 5V7c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46A7.93 7.93 0 0 0 20 13c0-4.42-3.58-8-8-8zm-6.7 2.74L3.84 7.28A7.93 7.93 0 0 0 4 13c0 4.42 3.58 8 8 8v5l5-5-5-5v4c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8z"/></svg>`;
+const SOURCE_DEL_SVG = `<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M6 19a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>`;
+
 function applyIndexStatusToSources(st, sources, fst) {
   const faceSt = fst || lastFacesStatus;
   const byId = new Map((sources || []).map((s) => [Number(s.id), s]));
-  $("#source-list").querySelectorAll("li[data-source-id]").forEach((li) => {
-    const id = Number(li.dataset.sourceId);
-    const missing = li.dataset.missing === "1";
+  $("#source-list").querySelectorAll("tr[data-source-id]").forEach((row) => {
+    const id = Number(row.dataset.sourceId);
+    const missing = row.dataset.missing === "1";
     const src = byId.get(id) || {
       id,
       exists: !missing,
-      pending_embed_count: Number(li.dataset.pendingEmbed || 0),
-      pending_faces_count: Number(li.dataset.pendingFaces || 0),
+      pending_embed_count: Number(row.dataset.pendingEmbed || 0),
+      pending_faces_count: Number(row.dataset.pendingFaces || 0),
     };
-    if (byId.has(id) && li.dataset) {
-      li.dataset.pendingEmbed = String(src.pending_embed_count ?? 0);
-      li.dataset.pendingFaces = String(src.pending_faces_count ?? 0);
+    if (byId.has(id) && row.dataset) {
+      row.dataset.pendingEmbed = String(src.pending_embed_count ?? 0);
+      row.dataset.pendingFaces = String(src.pending_faces_count ?? 0);
+      if (src.shadow_path != null) row.dataset.shadowPath = src.shadow_path || "";
     }
-    const progRow = li.querySelector(".source-progress-row");
-    const prog = li.querySelector(".source-progress");
-    const counts = li.querySelector(".source-counts");
+    const progRow = row.querySelector(".source-progress-row");
+    const prog = row.querySelector(".source-progress");
+    const counts = row.querySelector(".source-counts");
     if (src && counts && byId.has(id)) {
       counts.innerHTML = formatSourceCounts(src);
     }
-    const reindexBtn = li.querySelector("[data-reindex]");
+    const shadowInput = row.querySelector("input[data-shadow-edit]");
+    if (shadowInput && byId.has(id) && document.activeElement !== shadowInput) {
+      const path = String(src.shadow_path || "").trim();
+      shadowInput.value = path;
+      shadowInput.defaultValue = path;
+      row.dataset.shadowPath = path;
+    }
+    const reindexBtn = row.querySelector("[data-reindex], [data-sync]");
     if (reindexBtn && byId.has(id)) {
       const enabled = Number(src.enabled ?? 1);
       reindexBtn.disabled = !enabled || missing;
     }
+    const unpackBusy =
+      !!st?.import?.running && Number(st.import.source_id) === Number(id);
     const indexBusy = archiveIsBusy(id, st) && st.phase !== "suspended";
     const facesBusy = archiveFacesBusy(id, faceSt) && faceSt.phase !== "suspended";
-    const busy = indexBusy || facesBusy;
-    li.classList.toggle("is-active", busy);
+    const busy = unpackBusy || indexBusy || facesBusy;
+    row.classList.toggle("is-active", busy);
     if (progRow) progRow.hidden = true;
     if (prog) prog.textContent = "";
   });
@@ -499,25 +766,52 @@ async function loadSources() {
       const embedOn = Number(s.embed_enabled ?? 0);
       const pending = Number(s.pending_embed_count || 0);
       const pendingFaces = Number(s.pending_faces_count || 0);
+      const isBackup = String(s.kind || "watched") === "backup";
+      const isDevice = String(s.kind || "watched") === "device";
+      const shadowOn = !!(s.shadow_enabled && s.shadow_path);
+      const syncOn = Number(s.sync_enabled ?? 0);
+      const badge = isBackup
+        ? `<span class="badge backup">backup</span>`
+        : `<span class="badge ${s.exists ? "ok" : "missing"}">${s.exists ? "mounted" : "missing"}</span>${
+            isDevice ? ` <span class="badge device">phone</span>` : ""
+          }`;
+      const off = !enabled;
+      const shadowPath = esc(s.shadow_path || "");
+      const actions = `
+        ${isDevice ? `<button type="button" class="source-icon-btn" data-pair-qr="${s.id}" title="Pair QR" aria-label="Pair QR">◎</button>` : ""}
+        ${isBackup
+          ? `<button type="button" class="source-icon-btn source-reindex" data-sync="${s.id}" title="Sync backup" aria-label="Sync backup" ${enabled && s.exists ? "" : "disabled"}>${SOURCE_REFRESH_SVG}</button>`
+          : `<button type="button" class="source-icon-btn source-reindex" data-reindex="${s.id}" title="Reindex" aria-label="Reindex" ${enabled && s.exists ? "" : "disabled"}>${SOURCE_REFRESH_SVG}</button>`}
+        <button type="button" class="source-icon-btn danger" data-del="${s.id}" title="Remove" aria-label="Remove">${SOURCE_DEL_SVG}</button>`;
+      const shadowRow = !isBackup
+        ? `<div class="source-shadow-row">
+            <span class="path-pick">
+              <input type="text" class="source-shadow-input" data-shadow-edit="${s.id}" value="${shadowPath}" placeholder="Shadow folder (default if empty)…" autocomplete="off" spellcheck="false" aria-label="Shadow folder" ${off ? "disabled" : ""} />
+              <button type="button" data-shadow-browse="${s.id}" title="Choose shadow folder" ${off ? "disabled" : ""}>…</button>
+            </span>
+          </div>`
+        : "";
       return `
-      <li data-source-id="${s.id}" data-missing="${s.exists ? "0" : "1"}" data-pending-embed="${pending}" data-pending-faces="${pendingFaces}" class="${enabled ? "" : "source-disabled"}">
-        <span class="badge ${s.exists ? "ok" : "missing"}">${s.exists ? "mounted" : "missing"}</span>
-        <div class="source-meta">
-          <input class="source-label" type="text" value="${esc(s.label)}" data-label="${s.id}" aria-label="Archive label" />
-          <div class="path">${esc(s.path)}</div>
-          <div class="source-counts">${formatSourceCounts(s)}</div>
+      <tr data-source-id="${s.id}" data-missing="${s.exists ? "0" : "1"}" data-pending-embed="${pending}" data-pending-faces="${pendingFaces}" data-shadow-path="${shadowPath}" class="${enabled ? "" : "source-disabled"}">
+        <td class="source-meta">
+          <input class="source-label" type="text" value="${esc(s.label)}" data-label="${s.id}" aria-label="Volume label" />
+          <div class="path">${esc(isDevice ? (s.pair_url || s.path) : s.path)}</div>
+          ${shadowRow}
+          <div class="source-status-row">
+            <span class="source-badges">${badge}</span>
+            <span class="source-counts">${formatSourceCounts(s)}</span>
+          </div>
           <div class="source-progress-row" hidden>
             <div class="source-progress"></div>
           </div>
-        </div>
-        <div class="source-actions">
-          <button type="button" class="source-toggle ${enabled ? "is-on" : ""}" data-include="${s.id}">Include</button>
-          <button type="button" class="source-toggle ${faceOn ? "is-on" : ""}" data-face-toggle="${s.id}" ${enabled ? "" : "disabled"}>Facematch</button>
-          <button type="button" class="source-toggle ${embedOn ? "is-on" : ""}" data-embed-toggle="${s.id}" ${enabled ? "" : "disabled"}>Embed</button>
-          <button type="button" class="source-icon-btn source-reindex" data-reindex="${s.id}" title="Reindex" aria-label="Reindex" ${enabled && s.exists ? "" : "disabled"}><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 6V1L7 6l5 5V7c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46A7.93 7.93 0 0 0 20 13c0-4.42-3.58-8-8-8zm-6.7 2.74L3.84 7.28A7.93 7.93 0 0 0 4 13c0 4.42 3.58 8 8 8v5l5-5-5-5v4c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8z"/></svg></button>
-          <button type="button" class="source-icon-btn danger" data-del="${s.id}" title="Remove" aria-label="Remove"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M6 19a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg></button>
-        </div>
-      </li>`;
+        </td>
+        ${sourceCheckCell("include", s.id, enabled)}
+        ${sourceCheckCell("face-toggle", s.id, faceOn, { disabled: off, available: !isBackup })}
+        ${sourceCheckCell("embed-toggle", s.id, embedOn, { disabled: off, available: !isBackup })}
+        ${sourceCheckCell("shadow-toggle", s.id, shadowOn, { disabled: off, available: !isBackup })}
+        ${sourceCheckCell("sync-toggle", s.id, syncOn, { disabled: off, available: !isBackup })}
+        <td class="source-col-act"><div class="source-actions">${actions}</div></td>
+      </tr>`;
     })
     .join("");
   applyIndexStatusToSources(st, sources, fst);
@@ -555,7 +849,7 @@ async function loadSources() {
     btn.addEventListener("click", async () => {
       if (
         !confirm(
-          "Remove this archive from the index? Files on disk are kept. Photos that also belong under another archive stay indexed."
+          "Remove this volume from the index? Files on disk are kept. Photos that also belong under another volume stay indexed."
         )
       )
         return;
@@ -564,59 +858,160 @@ async function loadSources() {
       refreshStats();
     });
   });
-  $("#source-list").querySelectorAll("[data-include]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const id = btn.dataset.include;
-      const next = !btn.classList.contains("is-on");
-      btn.classList.toggle("is-on", next);
-      const li = btn.closest("li");
-      li?.classList.toggle("source-disabled", !next);
-      li?.querySelectorAll("[data-face-toggle], [data-embed-toggle]").forEach((b) => {
+  $("#source-list").querySelectorAll("[data-include]").forEach((input) => {
+    input.addEventListener("change", async () => {
+      const id = input.dataset.include;
+      const next = input.checked;
+      const row = input.closest("tr");
+      row?.classList.toggle("source-disabled", !next);
+      row?.querySelectorAll("[data-face-toggle], [data-embed-toggle], [data-shadow-toggle], [data-sync-toggle], [data-shadow-edit], [data-shadow-browse]").forEach((b) => {
         b.disabled = !next;
       });
-      const reindexBtn = li?.querySelector("[data-reindex]");
-      if (reindexBtn) reindexBtn.disabled = !next || li?.dataset.missing === "1";
+      const reindexBtn = row?.querySelector("[data-reindex], [data-sync]");
+      if (reindexBtn) reindexBtn.disabled = !next || row?.dataset.missing === "1";
       try {
         await api(`/api/sources/${id}/enable?enabled=${next}`, { method: "POST" });
       } catch (err) {
-        btn.classList.toggle("is-on", !next);
-        li?.classList.toggle("source-disabled", next);
-        li?.querySelectorAll("[data-face-toggle], [data-embed-toggle]").forEach((b) => {
+        input.checked = !next;
+        row?.classList.toggle("source-disabled", next);
+        row?.querySelectorAll("[data-face-toggle], [data-embed-toggle], [data-shadow-toggle], [data-sync-toggle], [data-shadow-edit], [data-shadow-browse]").forEach((b) => {
           b.disabled = next;
         });
-        if (reindexBtn) reindexBtn.disabled = next || li?.dataset.missing === "1";
+        if (reindexBtn) reindexBtn.disabled = next || row?.dataset.missing === "1";
         alert(err.message);
       }
     });
   });
-  $("#source-list").querySelectorAll("[data-face-toggle]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const id = btn.dataset.faceToggle;
-      const next = !btn.classList.contains("is-on");
-      btn.classList.toggle("is-on", next);
+  $("#source-list").querySelectorAll("[data-face-toggle]").forEach((input) => {
+    input.addEventListener("change", async () => {
+      const id = input.dataset.faceToggle;
+      const next = input.checked;
       try {
         const st = await api(`/api/sources/${id}/face_enabled?enabled=${next}`, { method: "POST" });
         lastFacesStatus = st;
         loadSources();
       } catch (err) {
-        btn.classList.toggle("is-on", !next);
+        input.checked = !next;
         alert(err.message);
       }
     });
   });
-  $("#source-list").querySelectorAll("[data-embed-toggle]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const id = btn.dataset.embedToggle;
-      const next = !btn.classList.contains("is-on");
-      btn.classList.toggle("is-on", next);
+  $("#source-list").querySelectorAll("[data-embed-toggle]").forEach((input) => {
+    input.addEventListener("change", async () => {
+      const id = input.dataset.embedToggle;
+      const next = input.checked;
       try {
         const st = await api(`/api/sources/${id}/embed_enabled?enabled=${next}`, { method: "POST" });
         lastIndexStatus = st;
         loadSources();
       } catch (err) {
-        btn.classList.toggle("is-on", !next);
+        input.checked = !next;
         alert(err.message);
       }
+    });
+  });
+  $("#source-list").querySelectorAll("[data-shadow-edit]").forEach((input) => {
+    const save = async () => {
+      const next = input.value.trim();
+      if (next === input.defaultValue.trim()) return;
+      try {
+        const src = await api(`/api/sources/${input.dataset.shadowEdit}`, {
+          method: "PATCH",
+          body: JSON.stringify({ shadow_path: next, shadow_enabled: !!next }),
+        });
+        input.value = src.shadow_path || "";
+        input.defaultValue = input.value;
+        const row = input.closest("tr");
+        if (row) row.dataset.shadowPath = input.value;
+        const shadowToggle = row?.querySelector("[data-shadow-toggle]");
+        if (shadowToggle) shadowToggle.checked = !!(src.shadow_enabled && src.shadow_path);
+      } catch (err) {
+        input.value = input.defaultValue;
+        alert(err.message);
+      }
+    };
+    input.addEventListener("blur", save);
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        input.blur();
+      } else if (e.key === "Escape") {
+        input.value = input.defaultValue;
+        input.blur();
+      }
+    });
+  });
+  $("#source-list").querySelectorAll("[data-shadow-browse]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const id = btn.dataset.shadowBrowse;
+      const row = btn.closest("tr");
+      const input = row?.querySelector("[data-shadow-edit]");
+      try {
+        const picked = await api(
+          `/api/pick-directory?title=${encodeURIComponent("Shadow folder for phone copies")}`,
+          { method: "POST" }
+        );
+        if (picked.cancelled || !picked.path) return;
+        const src = await api(`/api/sources/${id}`, {
+          method: "PATCH",
+          body: JSON.stringify({ shadow_path: picked.path, shadow_enabled: true }),
+        });
+        if (input) {
+          input.value = src.shadow_path || "";
+          input.defaultValue = input.value;
+        }
+        if (row) row.dataset.shadowPath = src.shadow_path || "";
+        const shadowToggle = row?.querySelector("[data-shadow-toggle]");
+        if (shadowToggle) shadowToggle.checked = true;
+      } catch (err) {
+        alert(err.message);
+      }
+    });
+  });
+  $("#source-list").querySelectorAll("[data-shadow-toggle]").forEach((input) => {
+    input.addEventListener("change", async () => {
+      const id = input.dataset.shadowToggle;
+      const next = input.checked;
+      const row = input.closest("tr");
+      try {
+        if (next && !(row?.dataset.shadowPath || "").trim()) {
+          await api(`/api/sources/${id}`, {
+            method: "PATCH",
+            body: JSON.stringify({ shadow_enabled: true }),
+          });
+        } else {
+          await api(`/api/sources/${id}`, {
+            method: "PATCH",
+            body: JSON.stringify({ shadow_enabled: next }),
+          });
+        }
+        loadSources();
+      } catch (err) {
+        input.checked = !next;
+        alert(err.message);
+      }
+    });
+  });
+  $("#source-list").querySelectorAll("[data-sync-toggle]").forEach((input) => {
+    input.addEventListener("change", async () => {
+      const id = input.dataset.syncToggle;
+      const next = input.checked;
+      try {
+        await api(`/api/sources/${id}`, {
+          method: "PATCH",
+          body: JSON.stringify({ sync_enabled: next }),
+        });
+      } catch (err) {
+        input.checked = !next;
+        alert(err.message);
+      }
+    });
+  });
+  $("#source-list").querySelectorAll("[data-pair-qr]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const id = Number(btn.dataset.pairQr);
+      const src = (lastSources || []).find((s) => Number(s.id) === id);
+      if (src) openPairDeviceDialog(src);
     });
   });
   $("#source-list").querySelectorAll("[data-reindex]").forEach((btn) => {
@@ -633,10 +1028,30 @@ async function loadSources() {
       }
     });
   });
+  $("#source-list").querySelectorAll("[data-sync]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const id = btn.dataset.sync;
+      btn.disabled = true;
+      try {
+        await api(`/api/sources/${id}/sync`, { method: "POST" });
+        await loadSources();
+      } catch (err) {
+        alert(err.message);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  });
 }
 
 function indexStatusText(st, sources, fst) {
   const bits = [];
+  const imp = st?.import;
+  if (imp?.running) {
+    bits.push("Unpack");
+  } else if (imp?.error) {
+    bits.push(String(imp.error));
+  }
   if (fst && (fst.running || fst.phase === "suspended")) {
     const name = archiveDisplayName(fst.source_id, sources);
     const msg = String(fst.message || "").trim();
@@ -654,15 +1069,18 @@ function indexStatusText(st, sources, fst) {
 }
 
 async function pollIndex() {
-  const st = await api("/api/index/status");
+  const [st, sources] = await Promise.all([
+    api("/api/index/status"),
+    api("/api/sources").catch(() => lastSources),
+  ]);
   const wasRunning = !!lastIndexStatus?.running;
   lastIndexStatus = st;
   const el = $("#index-status");
   el.textContent = indexStatusText(st, lastSources, lastFacesStatus);
+  if (sources) await applySourcesLive(sources);
   applyIndexStatusToSources(st, lastSources, lastFacesStatus);
   if (!st.running) {
     refreshStats();
-    // Refresh archive count lines after a job finishes.
     if (wasRunning) loadSources();
   }
 }
@@ -673,9 +1091,11 @@ let dupePhotosById = new Map();
 function dupeGroupSelectionState(groupEl) {
   const members = [...groupEl.querySelectorAll(".dupe-members [data-id]")];
   const selectedCount = members.filter((el) => dupeSelected.has(Number(el.dataset.id))).length;
+  const unmatched = groupEl.dataset.group === "unmatched";
   const selectable = members.filter((el) => {
     if (el.dataset.alt === "1") return false;
     if (photoVisibility === "removed") return el.dataset.culled === "1";
+    if (unmatched) return el.dataset.culled !== "1";
     return el.dataset.culled !== "1" && el.dataset.keeper !== "1";
   });
   return { selectedCount, nonPrimaryCount: selectable.length, nonPrimary: selectable };
@@ -685,15 +1105,20 @@ function syncDupeSelectToggleLabel(btn, selectedCount, nonPrimaryCount) {
   if (selectedCount > 0) {
     btn.textContent = "Unselect all";
     btn.disabled = false;
+  } else if (btn.dataset.group === "unmatched" && photoVisibility !== "removed") {
+    btn.textContent = nonPrimaryCount
+      ? `Select all (${nonPrimaryCount})`
+      : "Select all";
+    btn.disabled = nonPrimaryCount === 0;
   } else if (photoVisibility === "removed") {
     btn.textContent = nonPrimaryCount
-      ? `Select removed (${nonPrimaryCount})`
-      : "Select removed";
+      ? `Select rejected (${nonPrimaryCount})`
+      : "Select rejected";
     btn.disabled = nonPrimaryCount === 0;
   } else {
     btn.textContent = nonPrimaryCount
-      ? `Select non-primary (${nonPrimaryCount})`
-      : "Select non-primary";
+      ? `Select non-preferred (${nonPrimaryCount})`
+      : "Select non-preferred";
     btn.disabled = nonPrimaryCount === 0;
   }
 }
@@ -718,10 +1143,7 @@ function syncDupeToolbar() {
   const galleryCount = $("#browse-gallery-count");
   if (galleryCount) {
     const total = dupePhotosById.size;
-    const parts = [];
-    if (n) parts.push(`${n} selected`);
-    if (total) parts.push(`${total} photo${total === 1 ? "" : "s"}`);
-    galleryCount.textContent = parts.join(" · ");
+    galleryCount.textContent = total ? `${n} / ${total}` : "";
   }
 
   const allBtn = $("#btn-browse-select-all");
@@ -732,26 +1154,28 @@ function syncDupeToolbar() {
   }
 
   const removeBtn = $("#btn-browse-remove");
-  const restoreBtn = $("#btn-browse-restore");
   const deleteBtn = $("#btn-browse-delete");
   const editBtn = $("#btn-browse-edit");
+  const exportBtn = $("#btn-browse-export");
   const addFolderBtn = $("#btn-browse-add-folder");
   const removeFolderBtn = $("#btn-browse-remove-folder");
   if (removeBtn) {
-    removeBtn.disabled = activeIds.length === 0;
-    removeBtn.textContent = "Remove selected";
-  }
-  if (restoreBtn) {
-    restoreBtn.disabled = removedIds.length === 0;
-    restoreBtn.textContent = "Restore selected";
+    const restoreMode = removedIds.length > 0;
+    removeBtn.disabled = restoreMode ? false : activeIds.length === 0;
+    removeBtn.textContent = restoreMode ? "Restore selected" : "Reject selected";
+    removeBtn.classList.toggle("danger", !restoreMode);
+    removeBtn.dataset.mode = restoreMode ? "restore" : "remove";
   }
   if (deleteBtn) {
-    deleteBtn.disabled = removedIds.length === 0;
-    deleteBtn.textContent = "Delete selected";
+    deleteBtn.disabled = removedIds.length === 0 || activeIds.length > 0;
   }
   if (editBtn) {
     editBtn.disabled = indexedIds.length === 0;
     editBtn.textContent = "Edit selection";
+  }
+  if (exportBtn) {
+    exportBtn.disabled = indexedIds.length === 0;
+    exportBtn.textContent = "Export selected";
   }
   if (addFolderBtn) {
     addFolderBtn.disabled = indexedIds.length === 0;
@@ -768,6 +1192,7 @@ function syncDupeToolbar() {
   }
   const actions = $(".browse-selection-actions");
   if (actions) actions.hidden = n === 0;
+  syncTimelineSelectionUi();
 }
 
 function selectedDupePhotos() {
@@ -796,6 +1221,15 @@ function selectDupeRemoved(scopeEl) {
   });
 }
 
+function selectDupeAll(scopeEl) {
+  scopeEl.querySelectorAll(".dupe-members [data-id]").forEach((el) => {
+    if (el.dataset.alt === "1") return;
+    const id = Number(el.dataset.id);
+    dupeSelected.add(id);
+    el.classList.add("selected");
+  });
+}
+
 function unselectDupeAll(scopeEl) {
   scopeEl.querySelectorAll(".dupe-members [data-id]").forEach((el) => {
     const id = Number(el.dataset.id);
@@ -808,6 +1242,7 @@ function renderDupeMember(m, { role = null } = {}) {
   const removed = !!m.culled;
   const isAlt = role === "active-alt";
   const isKeeper = !!m.is_keeper && !removed && !isAlt;
+  const inScope = !!m.in_scope;
   const selected = dupeSelected.has(m.id);
   const path = photoPath(m);
   const classes = [
@@ -815,6 +1250,7 @@ function renderDupeMember(m, { role = null } = {}) {
     isKeeper ? "keeper" : "",
     removed ? "removed" : "",
     isAlt ? "active-alt" : "",
+    inScope ? "in-scope" : "out-of-scope",
     selected ? "selected" : "",
   ]
     .filter(Boolean)
@@ -822,13 +1258,15 @@ function renderDupeMember(m, { role = null } = {}) {
 
   let badge = "";
   if (isAlt) badge = `<span class="tag kept-tag">KEPT</span>`;
-  else if (removed) badge = `<span class="removed-badge">REMOVED</span>`;
-  else if (isKeeper) badge = `<span class="tag">PRIMARY</span>`;
+  else if (removed) badge = `<span class="removed-badge">REJECTED</span>`;
+  else if (isKeeper) badge = `<span class="tag">PREFERRED</span>`;
+  const outsideBadge = !inScope ? `<span class="tree-badge">OUTSIDE</span>` : "";
 
   return `
-    <article class="${classes}" data-id="${m.id}" data-keeper="${isKeeper ? 1 : 0}" data-culled="${removed ? 1 : 0}" data-alt="${isAlt ? 1 : 0}" data-orientation="${orientationDeg(m)}" data-mirrored="${isMirrored(m) ? 1 : 0}">
+    <article class="${classes}" data-id="${m.id}" data-keeper="${isKeeper ? 1 : 0}" data-culled="${removed ? 1 : 0}" data-alt="${isAlt ? 1 : 0}" data-in-scope="${inScope ? 1 : 0}" data-orientation="${orientationDeg(m)}" data-mirrored="${isMirrored(m) ? 1 : 0}">
       ${badge}
       <div class="card-media">
+        ${outsideBadge}
         <img loading="lazy" src="/api/thumb/${m.id}" alt="" draggable="false" style="${orientationStyle(m)}" />
         ${browseItemHoverDetail(m)}
       </div>
@@ -849,6 +1287,39 @@ function includeCulled() {
 }
 
 /** Culled/active filter. Selection filter is display-only (see respectSelection). */
+function currentAspectFilter() {
+  return $("#aspect-filter")?.value || "";
+}
+
+function syncAspectFilterStyle() {
+  const el = $("#aspect-filter");
+  if (el) el.classList.toggle("is-filtered", !!el.value);
+}
+
+const SQUARE_MAX_RATIO = 1.05;
+const PANORAMA_MIN_RATIO = 2.35;
+
+function photoAspectClass(p) {
+  if (p?.aspect_class) return p.aspect_class;
+  const w0 = Number(p?.width);
+  const h0 = Number(p?.height);
+  if (!Number.isFinite(w0) || !Number.isFinite(h0) || w0 <= 0 || h0 <= 0) return "";
+  const rot = Number(p?.orientation) || 0;
+  const dw = rot % 180 === 90 ? h0 : w0;
+  const dh = rot % 180 === 90 ? w0 : h0;
+  const ratio = Math.max(dw, dh) / Math.min(dw, dh);
+  if (ratio >= PANORAMA_MIN_RATIO) return "panorama";
+  if (ratio <= SQUARE_MAX_RATIO) return "square";
+  return dw > dh ? "landscape" : "portrait";
+}
+
+function filterByAspect(items) {
+  const aspect = currentAspectFilter();
+  if (!aspect) return items;
+  return items.filter((p) => photoAspectClass(p) === aspect);
+}
+
+/** Culled/active filter. Selection filter is display-only (see respectSelection). */
 function filterByPhotoVisibility(items, { respectSelection = false } = {}) {
   if (!Array.isArray(items)) return [];
   let out;
@@ -862,7 +1333,7 @@ function filterByPhotoVisibility(items, { respectSelection = false } = {}) {
 }
 
 function syncPhotoVisibilityButtons() {
-  document.querySelectorAll(".visibility-btn").forEach((btn) => {
+  document.querySelectorAll(".visibility-modes [data-visibility]").forEach((btn) => {
     btn.classList.toggle("active", btn.dataset.visibility === photoVisibility);
   });
 }
@@ -918,10 +1389,46 @@ function togglePress(el) {
 /** Toggle button ids persisted in localStorage (missing key → keep HTML default). */
 const PRESS_PREFS = [
   { id: "browse-show-face", key: "fotoman.browseShowFace" },
-  { id: "browse-show-months", key: "fotoman.browseShowMonths" },
   { id: "browse-show-nested", key: "fotoman.browseShowNested" },
   { id: "lightbox-show-frames", key: "fotoman.lightboxShowFrames" },
 ];
+
+const THUMB_CROP_KEY = "fotoman.browseThumbCrop";
+/** Details table: expanded cluster group_ids (default collapsed). */
+const detailsExpandedGroups = new Set();
+/** Old Expand/dupes workspace should restore as Compare. */
+let restoreCompareView = false;
+
+function isThumbCropOn() {
+  try {
+    return localStorage.getItem(THUMB_CROP_KEY) === "1";
+  } catch (_) {
+    return false;
+  }
+}
+
+function syncThumbCropClass() {
+  document.body.classList.toggle("thumb-crop", isThumbCropOn());
+}
+
+function setThumbCropPref(on) {
+  try {
+    localStorage.setItem(THUMB_CROP_KEY, on ? "1" : "0");
+  } catch (_) {
+    /* ignore */
+  }
+  syncThumbCropClass();
+}
+
+function loadGalleryLayoutPref() {
+  try {
+    const saved = localStorage.getItem("fotoman.galleryLayout");
+    const tab = localStorage.getItem(TAB_STORAGE_KEY);
+    if (saved === "clusters" || tab === "dupes") restoreCompareView = true;
+  } catch (_) {
+    /* ignore */
+  }
+}
 
 function loadPressPrefs() {
   for (const { id, key } of PRESS_PREFS) {
@@ -935,6 +1442,8 @@ function loadPressPrefs() {
       /* ignore */
     }
   }
+  loadGalleryLayoutPref();
+  syncThumbCropClass();
 }
 
 function savePressPref(id) {
@@ -964,25 +1473,36 @@ function bindPressPrefs() {
 }
 
 async function loadDupes() {
-  const q = includeCulled() ? "?include_culled=true" : "";
+  return regroupClusters({ persist: false });
+}
+
+/** Render cluster groups already shaped like /api/duplicates items. */
+function renderDupeGroups(rawGroups) {
   const scopeIds = browseScopedPhotoIds();
   const root = $("#dupe-list");
+  if (!root) return;
   if (!scopeIds.size) {
     dupePhotosById = new Map();
     dupeSelected.clear();
     root.innerHTML = `<p class="muted">Select items in the tree to show clusters.</p>`;
     syncDupeToolbar();
+    renderBrowseTimeline([]);
     return;
   }
-  let groups = await api(`/api/duplicates${q}`);
+  let groups = Array.isArray(rawGroups) ? rawGroups : [];
   let unmatched = [];
+
+  const annotate = (m) => ({
+    ...m,
+    in_scope: m.in_scope === true || m.in_scope === 1 || scopeIds.has(m.id),
+  });
 
   if (photoVisibility === "removed") {
     const clusteredRemoved = new Set();
     groups = groups
       .map((g) => {
-        const members = g.members || [];
-        const removed = members.filter((m) => m.culled && scopeIds.has(m.id));
+        const members = (g.members || []).map(annotate);
+        const removed = members.filter((m) => m.culled && m.in_scope);
         if (!removed.length) return null;
         removed.forEach((m) => clusteredRemoved.add(m.id));
         const activeAlts = members.filter((m) => !m.culled);
@@ -1000,15 +1520,33 @@ async function loadDupes() {
       (p) => p?.id != null && p.culled && scopeIds.has(p.id) && !clusteredRemoved.has(p.id)
     );
   } else {
+    const clusteredIds = new Set();
     groups = groups
-      .map((g) => ({
-        ...g,
-        members: filterByPhotoVisibility(
-          (g.members || []).filter((m) => scopeIds.has(m.id)),
-          { respectSelection: true }
-        ),
-      }))
-      .filter((g) => (g.members || []).length >= 2);
+      .map((g) => {
+        let members = (g.members || []).map(annotate);
+        members = filterByPhotoVisibility(members, { respectSelection: false });
+        if (photoVisibility === "selected") {
+          const hasSelected = members.some(
+            (m) => m.in_scope && browseSelected.has(browseItemKey(m))
+          );
+          if (!hasSelected) return { ...g, members: [] };
+          members = members.filter(
+            (m) => !m.in_scope || browseSelected.has(browseItemKey(m))
+          );
+        }
+        if (!members.some((m) => m.in_scope)) return { ...g, members: [] };
+        return { ...g, members };
+      })
+      .filter((g) => (g.members || []).length >= 1);
+    groups.forEach((g) =>
+      (g.members || []).forEach((m) => {
+        if (m.in_scope) clusteredIds.add(m.id);
+      })
+    );
+    unmatched = filterByPhotoVisibility(
+      browseItems.filter((p) => p?.id != null && scopeIds.has(p.id) && !clusteredIds.has(p.id)),
+      { respectSelection: true }
+    );
   }
 
   const liveIds = new Set();
@@ -1029,6 +1567,7 @@ async function loadDupes() {
   if (!groups.length && !unmatched.length) {
     root.innerHTML = `<p class="muted">No clusters in the current selection.</p>`;
     syncDupeToolbar();
+    renderBrowseTimeline(browseDisplayItems());
     return;
   }
 
@@ -1048,19 +1587,23 @@ async function loadDupes() {
         photoVisibility === "removed"
           ? groupSelected
             ? "Unselect all"
-            : `Select removed${selectable ? ` (${selectable})` : ""}`
+            : `Select rejected${selectable ? ` (${selectable})` : ""}`
           : groupSelected
             ? "Unselect all"
-            : `Select non-primary${selectable ? ` (${selectable})` : ""}`;
+            : `Select non-preferred${selectable ? ` (${selectable})` : ""}`;
       const altNote = altCount
         ? ` · ${altCount} kept alternative${altCount === 1 ? "" : "s"}`
         : photoVisibility === "removed"
           ? " · no kept alternative"
           : "";
+      const outsideN = (g.members || []).filter((m) => !m.in_scope).length;
+      const outsideNote = outsideN
+        ? ` · ${outsideN} outside tree`
+        : "";
       return `
       <section class="dupe-group" data-group="${g.id}">
         <div class="dupe-group-head month-divider" role="separator">
-          <span class="dupe-group-title">${g.kind}${altNote}</span>
+          <span class="dupe-group-title">${g.kind}${altNote}${outsideNote}</span>
           <button type="button" class="dupe-select-toggle" data-group="${g.id}" ${
             groupSelected || selectable ? "" : "disabled"
           }>${toggleLabel}</button>
@@ -1075,17 +1618,29 @@ async function loadDupes() {
     .join("");
 
   const unmatchedHtml = unmatched.length
-    ? `
+    ? (() => {
+        const removedMode = photoVisibility === "removed";
+        const title = removedMode
+          ? `Unmatched rejected (${unmatched.length})`
+          : `Unmatched (${unmatched.length})`;
+        const toggleLabel = removedMode
+          ? `Select rejected (${unmatched.length})`
+          : `Select all (${unmatched.length})`;
+        const note = removedMode
+          ? "No cluster partners at the current level — including no kept active alternative."
+          : "No cluster partners at the current level.";
+        return `
       <section class="dupe-group dupe-unmatched" data-group="unmatched">
         <div class="dupe-group-head month-divider" role="separator">
-          <span class="dupe-group-title">Unmatched removed (${unmatched.length})</span>
-          <button type="button" class="dupe-select-toggle" data-group="unmatched">Select removed (${unmatched.length})</button>
+          <span class="dupe-group-title">${title}</span>
+          <button type="button" class="dupe-select-toggle" data-group="unmatched">${toggleLabel}</button>
         </div>
-        <p class="muted dupe-unmatched-note">No cluster partners at the current level — including no kept active alternative.</p>
+        <p class="muted dupe-unmatched-note">${note}</p>
         <div class="dupe-members">
-          ${unmatched.map((m) => renderDupeMember(m)).join("")}
+          ${unmatched.map((m) => renderDupeMember({ ...m, in_scope: true })).join("")}
         </div>
-      </section>`
+      </section>`;
+      })()
     : "";
 
   root.innerHTML = groupHtml + unmatchedHtml;
@@ -1095,6 +1650,7 @@ async function loadDupes() {
     el.addEventListener("click", (e) => {
       e.preventDefault();
       if (el.dataset.alt === "1") return;
+      if (isCardHoverDetailEvent(e) && hoverDetailHasSelection()) return;
       if (clickTimer) clearTimeout(clickTimer);
       clickTimer = setTimeout(() => {
         clickTimer = null;
@@ -1108,6 +1664,20 @@ async function loadDupes() {
         }
         syncDupeToolbar();
       }, 220);
+    });
+    el.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      const id = Number(el.dataset.id);
+      if (!dupeSelected.has(id)) {
+        root.querySelectorAll(".dupe-members [data-id].selected").forEach((card) => {
+          card.classList.remove("selected");
+        });
+        dupeSelected.clear();
+        dupeSelected.add(id);
+        el.classList.add("selected");
+        syncDupeToolbar();
+      }
+      openEditPropertiesModal();
     });
     el.addEventListener("dblclick", (e) => {
       e.preventDefault();
@@ -1141,6 +1711,7 @@ async function loadDupes() {
       const group = btn.closest(".dupe-group");
       const { selectedCount } = dupeGroupSelectionState(group);
       if (selectedCount > 0) unselectDupeAll(group);
+      else if (group?.dataset.group === "unmatched") selectDupeAll(group);
       else if (photoVisibility === "removed") selectDupeRemoved(group);
       else selectDupeNonPrimary(group);
       syncDupeToolbar();
@@ -1148,38 +1719,39 @@ async function loadDupes() {
   });
 
   syncDupeToolbar();
+  applyBrowseTileSize();
+  renderBrowseTimeline(browseDisplayItems());
 }
 
 const TAB_STORAGE_KEY = "fotoman.activeTab";
 const VALID_TABS = new Set(["browse", "map", "dupes"]);
-const GALLERY_WORKSPACE_VIEWS = new Set(["thumbs", "details"]);
-const TIMELINE_WORKSPACE_VIEWS = new Set(["thumbs", "details", "map"]);
-const VALID_WORKSPACE_VIEWS = new Set(["thumbs", "details", "map", "dupes"]);
+const BROWSE_PANEL_VIEWS = new Set(["stack", "details"]);
+const GALLERY_ACTIONS_VIEWS = new Set(["stack", "details", "compare"]);
+const TILE_SIZE_VIEWS = new Set(["stack", "compare"]);
+const TIMELINE_WORKSPACE_VIEWS = new Set(["stack", "details", "map", "compare"]);
+const VALID_WORKSPACE_VIEWS = new Set(["stack", "compare", "map", "details"]);
 
 function syncWorkspaceViewButtons(view) {
   document.querySelectorAll(".browse-view-btn").forEach((b) => {
     b.classList.toggle("active", b.dataset.workspaceView === view);
   });
-  syncClusterLevelControls(view);
+  const showClusterRange =
+    view === "compare" || view === "details" || view === "stack";
+  syncClusterLevelControls(showClusterRange);
   const sizeControl = $("#browse-size-control");
-  if (sizeControl) sizeControl.hidden = view !== "thumbs";
+  if (sizeControl) sizeControl.hidden = !TILE_SIZE_VIEWS.has(view);
   const galleryActions = $(".browse-gallery-actions");
-  if (galleryActions) {
-    galleryActions.hidden = !(GALLERY_WORKSPACE_VIEWS.has(view) || view === "dupes");
-  }
+  if (galleryActions) galleryActions.hidden = !GALLERY_ACTIONS_VIEWS.has(view);
   const frameOpt = $("#browse-show-face");
   if (frameOpt) {
-    frameOpt.hidden =
-      !GALLERY_WORKSPACE_VIEWS.has(view) || browseView !== "people";
+    frameOpt.hidden = view !== "stack" || browseView !== "people";
   }
-  const monthsOpt = $("#browse-show-months");
-  if (monthsOpt) monthsOpt.hidden = !GALLERY_WORKSPACE_VIEWS.has(view);
 }
 
 function currentWorkspaceView() {
   return (
     document.querySelector(".browse-view-btn.active")?.dataset.workspaceView ||
-    browseGalleryView
+    (browseGalleryView === "details" ? "details" : "stack")
   );
 }
 
@@ -1192,8 +1764,10 @@ function activateTab(tab, opts = {}) {
 
   let workspaceView = opts.workspaceView;
   if (!workspaceView) {
-    if (tab === "browse") workspaceView = browseGalleryView;
-    else if (tab === "map" || tab === "dupes") workspaceView = tab;
+    if (tab === "browse") {
+      workspaceView = browseGalleryView === "details" ? "details" : "stack";
+    } else if (tab === "map") workspaceView = "map";
+    else if (tab === "dupes") workspaceView = "compare";
     else workspaceView = null;
   }
   if (workspaceView && VALID_WORKSPACE_VIEWS.has(workspaceView)) {
@@ -1205,24 +1779,197 @@ function activateTab(tab, opts = {}) {
     syncWorkspaceViewButtons(null);
   }
 
-  if (tab === "dupes") regroupClusters();
   if (tab === "map") loadMap(true);
 }
 
-function activateWorkspaceView(view) {
-  if (!VALID_WORKSPACE_VIEWS.has(view)) view = "thumbs";
-  if (GALLERY_WORKSPACE_VIEWS.has(view)) {
-    browseGalleryView = view;
+function photoIdFromBrowseKey(key) {
+  if (!key) return null;
+  const s = String(key);
+  if (!s.startsWith("id:")) return null;
+  const n = Number(s.slice(3));
+  return Number.isFinite(n) ? n : null;
+}
+
+function photoForBrowseKey(key) {
+  if (!key) return null;
+  const fromBrowse =
+    browseItems.find((p) => browseItemKey(p) === key) ||
+    browseItemsFull.find((p) => browseItemKey(p) === key);
+  if (fromBrowse) return fromBrowse;
+  const id = photoIdFromBrowseKey(key);
+  if (id == null) return null;
+  return dupePhotosById?.get?.(id) || null;
+}
+
+function captureWorkspaceSelection() {
+  if (isDupesWorkspace()) {
+    const ids = [...dupeSelected];
+    const keys = ids.map((id) => `id:${id}`);
+    const focusId = ids.length ? ids[ids.length - 1] : null;
+    return {
+      keys,
+      focusKey: focusId != null ? `id:${focusId}` : browseAnchorKey,
+    };
+  }
+  const keys = [...browseSelected];
+  const focusKey =
+    browseAnchorKey && browseSelected.has(browseAnchorKey)
+      ? browseAnchorKey
+      : keys.length
+        ? keys[keys.length - 1]
+        : null;
+  return { keys, focusKey };
+}
+
+function restoreWorkspaceSelection({ keys, focusKey }) {
+  browseSelected = new Set(keys || []);
+  browseAnchorKey = focusKey || null;
+}
+
+function syncDupeSelectionFromBrowse() {
+  const ids = new Set();
+  for (const key of browseSelected) {
+    const id = photoIdFromBrowseKey(key);
+    if (id != null && dupePhotosById?.has?.(id)) ids.add(id);
+  }
+  dupeSelected = ids;
+  document.querySelectorAll("#dupe-list .dupe-members [data-id]").forEach((el) => {
+    el.classList.toggle("selected", dupeSelected.has(Number(el.dataset.id)));
+  });
+  syncDupeToolbar();
+}
+
+function ensureVisibleSelectionStandIns() {
+  if (!browseKeepersOnlyView()) return;
+  const items = browseDisplayItems();
+  const byGroup = new Map();
+  for (const p of items) {
+    if (p?.group_id != null && !byGroup.has(p.group_id)) byGroup.set(p.group_id, p);
+  }
+  for (const key of [...browseSelected]) {
+    if (items.some((p) => browseItemKey(p) === key)) continue;
+    const photo = photoForBrowseKey(key);
+    if (!photo || photo.group_id == null) continue;
+    const standIn = byGroup.get(photo.group_id);
+    if (standIn) browseSelected.add(browseItemKey(standIn));
+  }
+}
+
+function expandDetailsForFocus(key) {
+  if (browseGalleryView !== "details" || !key) return;
+  const photo = photoForBrowseKey(key);
+  if (photo?.group_id == null) return;
+  if (isClusterKeeper(photo)) return;
+  detailsExpandedGroups.add(String(photo.group_id));
+}
+
+function scrollWorkspaceToFocus(key) {
+  if (!key) return;
+  const run = () => {
+    const view = currentWorkspaceView();
+    if (view === "map") {
+      const tryFocus = (photo) => {
+        const lat = Number(photo?.lat);
+        const lon = Number(photo?.lon);
+        if (photo?.id == null || !Number.isFinite(lat) || !Number.isFinite(lon)) {
+          return false;
+        }
+        focusMapOnPhoto(photo.id, lat, lon);
+        return true;
+      };
+      if (tryFocus(photoForBrowseKey(key))) return;
+      for (const k of browseSelected) {
+        if (tryFocus(photoForBrowseKey(k))) return;
+      }
+      return;
+    }
+    if (isDupesWorkspace()) {
+      const id = photoIdFromBrowseKey(key);
+      if (id == null) return;
+      const el = $("#dupe-list")?.querySelector(
+        `.dupe-members [data-id="${CSS.escape(String(id))}"]`
+      );
+      el?.scrollIntoView({ block: "center", behavior: "auto" });
+      return;
+    }
+    let targetKey = key;
+    if (browseKeepersOnlyView()) {
+      const photo = photoForBrowseKey(key);
+      if (photo?.group_id != null) {
+        const standIn = browseDisplayItems().find(
+          (p) => p.group_id === photo.group_id
+        );
+        if (standIn) targetKey = browseItemKey(standIn);
+      }
+    }
+    const el = $("#browse-results")?.querySelector(
+      `[data-browse-key="${CSS.escape(targetKey)}"]`
+    );
+    el?.scrollIntoView({ block: "center", behavior: "auto" });
+  };
+  requestAnimationFrame(() => requestAnimationFrame(run));
+}
+
+/** Stack / Details browse panel (not Compare). */
+async function showGalleryOrClusters() {
+  // Apply preview keepers locally, switch UI immediately, persist in background.
+  if (clustersPreviewDirty && lastClusterPreviewItems) {
+    applyClusterAssignmentsToBrowseItems(lastClusterPreviewItems);
+  }
+  const view = browseGalleryView === "details" ? "details" : "stack";
+  activateTab("browse", { workspaceView: view });
+  renderBrowseResults();
+  void persistClustersPreview();
+}
+
+async function activateWorkspaceView(view) {
+  // Migrate old workspace names.
+  if (view === "dupes") view = "compare";
+  if (view === "thumbs") view = "stack";
+  if (!VALID_WORKSPACE_VIEWS.has(view)) view = "stack";
+  const captured = captureWorkspaceSelection();
+  restoreWorkspaceSelection(captured);
+  if (BROWSE_PANEL_VIEWS.has(view)) {
+    browseGalleryView = view === "details" ? "details" : "thumbs";
     saveBrowseGalleryPref();
-    activateTab("browse", { workspaceView: view });
-    renderBrowseResults();
+    if (clustersPreviewDirty && lastClusterPreviewItems) {
+      applyClusterAssignmentsToBrowseItems(lastClusterPreviewItems);
+    }
+    expandDetailsForFocus(captured.focusKey);
+    ensureVisibleSelectionStandIns();
+    await showGalleryOrClusters();
+    expandDetailsForFocus(captured.focusKey);
+    ensureVisibleSelectionStandIns();
+    if (view === "details" && captured.focusKey) {
+      const el = $("#browse-results")?.querySelector(
+        `[data-browse-key="${CSS.escape(captured.focusKey)}"]`
+      );
+      if (el?.hidden) renderBrowseResults();
+    }
+    syncBrowseSelectionDom();
+    scrollWorkspaceToFocus(captured.focusKey);
+  } else if (view === "compare") {
+    if (clustersPreviewDirty && lastClusterPreviewItems) {
+      applyClusterAssignmentsToBrowseItems(lastClusterPreviewItems);
+    }
+    debouncedRegroup.cancel?.();
+    activateTab("dupes", { workspaceView: "compare" });
+    renderBrowseTimeline(browseDisplayItems());
+    await regroupClusters({ persist: false });
+    restoreWorkspaceSelection(captured);
+    syncDupeSelectionFromBrowse();
+    scrollWorkspaceToFocus(captured.focusKey);
+    void persistClustersPreview();
   } else if (view === "map") {
+    if (clustersPreviewDirty && lastClusterPreviewItems) {
+      applyClusterAssignmentsToBrowseItems(lastClusterPreviewItems);
+    }
     activateTab("map", { workspaceView: "map" });
     renderBrowseTimeline(browseDisplayItems());
+    if (photoMapLoadInFlight) await photoMapLoadInFlight;
     setTimeout(() => photoMap?.invalidateSize(), 60);
-  } else if (view === "dupes") {
-    activateTab("dupes", { workspaceView: "dupes" });
-    renderBrowseTimeline([]);
+    scrollWorkspaceToFocus(captured.focusKey);
+    void persistClustersPreview();
   }
 }
 
@@ -1241,6 +1988,12 @@ $("#btn-close-archive")?.addEventListener("click", () => {
 
 /** Cached from /api/settings — stay | follow after Place edits. */
 let placeEditNav = "stay";
+/** App version from /api/settings. */
+let appVersion = "";
+/** "newest" or "oldest" — cached from server settings. */
+let dateTreeOrder = "newest";
+/** Persist Edit-dialog "Write timestamp to EXIF". */
+let writeDateToExif = false;
 /** True when VLM provider + API key + model are configured. */
 let vqaConfigured = false;
 /** Current Ask AI mode: where | describe | freeform */
@@ -1251,16 +2004,18 @@ let placeSuggestPending = null;
 function applyCachedSettings(s) {
   if (!s || typeof s !== "object") return;
   placeEditNav = s.place_edit_nav === "follow" ? "follow" : "stay";
+  dateTreeOrder = s.date_tree_order === "oldest" ? "oldest" : "newest";
+  if (typeof s.write_date_to_exif === "boolean") {
+    writeDateToExif = s.write_date_to_exif;
+  }
+  if (typeof s.version === "string" && s.version.trim()) {
+    appVersion = s.version.trim();
+  }
   if (typeof s.vqa_configured === "boolean") {
     vqaConfigured = s.vqa_configured;
   } else {
-    const provider = String(s.vqa_provider || "").trim().toLowerCase();
     vqaConfigured =
-      provider !== "" &&
-      provider !== "none" &&
-      provider !== "off" &&
-      !!s.vqa_api_key_set &&
-      !!String(s.vqa_model || "").trim();
+      !!s.vqa_api_key_set && !!String(s.vqa_base_url || "").trim();
   }
 }
 
@@ -1283,56 +2038,140 @@ async function openPrefsDialog() {
   try {
     const s = await api("/api/settings");
     applyCachedSettings(s);
-    const modelEl = $("#pref-model-id");
     const nearEl = $("#pref-near-dup");
     const faceEl = $("#pref-face-match");
-    const dateOrderEl = $("#pref-date-tree-order");
     const placeNavEl = $("#pref-place-edit-nav");
-    const writeExifEl = $("#pref-write-date-exif");
     const writeMtimeEl = $("#pref-write-date-mtime");
-    const providerEl = $("#pref-vqa-provider");
+    const copiesEl = $("#pref-collection-copies");
     const keyEl = $("#pref-vqa-api-key");
-    const keyStatus = $("#pref-vqa-key-status");
     const baseEl = $("#pref-vqa-base-url");
     const modelVqaEl = $("#pref-vqa-model");
-    if (modelEl) modelEl.value = s.model_id || "";
     if (nearEl) nearEl.value = s.near_dup_threshold ?? "";
     if (faceEl) faceEl.value = s.face_match_threshold ?? "";
-    if (dateOrderEl) {
-      dateOrderEl.value = s.date_tree_order === "oldest" ? "oldest" : "newest";
-    }
-    if (placeNavEl) {
-      placeNavEl.value = placeEditNav === "follow" ? "follow" : "stay";
-    }
-    if (writeExifEl) writeExifEl.checked = !!s.write_date_to_exif;
+    if (placeNavEl) placeNavEl.checked = placeEditNav === "follow";
     if (writeMtimeEl) writeMtimeEl.checked = !!s.write_date_to_mtime;
-    if (providerEl) providerEl.value = s.vqa_provider || "openai";
+    if (copiesEl) copiesEl.checked = s.collection_copies === "cluster";
+    const cropEl = $("#pref-thumb-crop");
+    if (cropEl) cropEl.checked = isThumbCropOn();
     if (keyEl) {
-      keyEl.value = "";
-      keyEl.placeholder = s.vqa_api_key_set ? "•••••••• (leave blank to keep)" : "sk-…";
+      keyEl.value = s.vqa_api_key_set ? VQA_KEY_MASK : "";
+      keyEl.placeholder = "sk-…";
     }
-    if (keyStatus) {
-      keyStatus.hidden = !s.vqa_api_key_set;
-      keyStatus.textContent = s.vqa_api_key_set ? "API key is saved." : "";
-    }
-    if (baseEl) baseEl.value = s.vqa_base_url || "https://api.openai.com/v1";
+    if (baseEl) baseEl.value = s.vqa_base_url || "";
     if (modelVqaEl) modelVqaEl.value = s.vqa_model || "gpt-4o-mini";
   } catch (ex) {
     if (err) {
       err.textContent = ex.message || "Failed to load preferences";
       err.hidden = false;
     }
-    const baseEl = $("#pref-vqa-base-url");
     const modelVqaEl = $("#pref-vqa-model");
-    if (baseEl && !baseEl.value) baseEl.value = "https://api.openai.com/v1";
     if (modelVqaEl && !modelVqaEl.value) modelVqaEl.value = "gpt-4o-mini";
+    const cropEl = $("#pref-thumb-crop");
+    if (cropEl) cropEl.checked = isThumbCropOn();
   }
   dlg.showModal();
 }
 
+function drawQr(host, url) {
+  if (!host) return;
+  host.replaceChildren();
+  if (!url || typeof QRCode !== "function") {
+    host.hidden = true;
+    return;
+  }
+  host.hidden = false;
+  try {
+    new QRCode(host, {
+      text: url,
+      width: 192,
+      height: 192,
+      colorDark: "#1a1f1c",
+      colorLight: "#ffffff",
+      correctLevel: QRCode.CorrectLevel.M,
+    });
+  } catch {
+    host.hidden = true;
+  }
+}
+
+function drawShareQr(url) {
+  drawQr($("#share-info-qr"), url);
+}
+
+function openShareInfoDialog({ name, url } = {}) {
+  const dlg = $("#share-info-dialog");
+  if (!dlg) return;
+  const title = $("#share-info-title");
+  const urlEl = $("#share-info-url");
+  if (title) title.textContent = name ? `Share “${name}”` : "Shared on Fotomob";
+  if (urlEl) urlEl.value = url || "";
+  drawShareQr(url || "");
+  dlg.showModal();
+}
+
+$("#btn-close-share-info")?.addEventListener("click", () => {
+  $("#share-info-dialog")?.close();
+});
+$("#share-info-dialog")?.addEventListener("click", (e) => {
+  if (e.target === e.currentTarget) e.currentTarget.close();
+});
+$("#btn-share-info-copy")?.addEventListener("click", async () => {
+  const url = ($("#share-info-url")?.value || "").trim();
+  if (!url) return;
+  try {
+    await navigator.clipboard.writeText(url);
+  } catch {
+    $("#share-info-url")?.select();
+  }
+});
+
+function openPairDeviceDialog(src) {
+  const dlg = $("#pair-device-dialog");
+  if (!dlg || !src) return;
+  const title = $("#pair-device-title");
+  const urlEl = $("#pair-device-url");
+  const url = src.pair_url || src.pair_id || "";
+  if (title) title.textContent = src.label ? `Pair “${src.label}”` : "Pair phone";
+  if (urlEl) urlEl.value = url;
+  drawQr($("#pair-device-qr"), url);
+  dlg.showModal();
+}
+
+$("#btn-close-pair-device")?.addEventListener("click", () => {
+  $("#pair-device-dialog")?.close();
+});
+$("#pair-device-dialog")?.addEventListener("click", (e) => {
+  if (e.target === e.currentTarget) e.currentTarget.close();
+});
+$("#btn-pair-device-copy")?.addEventListener("click", async () => {
+  const url = ($("#pair-device-url")?.value || "").trim();
+  if (!url) return;
+  try {
+    await navigator.clipboard.writeText(url);
+  } catch {
+    $("#pair-device-url")?.select();
+  }
+});
+
 $("#btn-open-prefs")?.addEventListener("click", openPrefsDialog);
 $("#btn-close-prefs")?.addEventListener("click", () => {
   $("#prefs-dialog")?.close();
+});
+
+function openAboutDialog() {
+  const dlg = $("#about-dialog");
+  if (!dlg) return;
+  const ver = $("#about-version");
+  if (ver) ver.textContent = appVersion || "0.1.0";
+  dlg.showModal();
+}
+
+$("#btn-open-about")?.addEventListener("click", openAboutDialog);
+$("#btn-close-about")?.addEventListener("click", () => {
+  $("#about-dialog")?.close();
+});
+$("#about-dialog")?.addEventListener("click", (e) => {
+  if (e.target === e.currentTarget) e.currentTarget.close();
 });
 
 $("#prefs-form")?.addEventListener("submit", async (e) => {
@@ -1344,28 +2183,31 @@ $("#prefs-form")?.addEventListener("submit", async (e) => {
     err.textContent = "";
   }
   const body = {
-    model_id: ($("#pref-model-id")?.value || "").trim(),
     near_dup_threshold: Number($("#pref-near-dup")?.value),
     face_match_threshold: Number($("#pref-face-match")?.value),
-    date_tree_order:
-      $("#pref-date-tree-order")?.value === "oldest" ? "oldest" : "newest",
-    place_edit_nav:
-      $("#pref-place-edit-nav")?.value === "follow" ? "follow" : "stay",
-    write_date_to_exif: !!$("#pref-write-date-exif")?.checked,
+    date_tree_order: dateTreeOrder,
+    place_edit_nav: $("#pref-place-edit-nav")?.checked ? "follow" : "stay",
+    write_date_to_exif: writeDateToExif,
     write_date_to_mtime: !!$("#pref-write-date-mtime")?.checked,
-    vqa_provider: $("#pref-vqa-provider")?.value || "openai",
+    collection_copies: $("#pref-collection-copies")?.checked ? "cluster" : "primary",
     vqa_base_url: ($("#pref-vqa-base-url")?.value || "").trim(),
     vqa_model: ($("#pref-vqa-model")?.value || "").trim(),
   };
-  const keyVal = $("#pref-vqa-api-key")?.value;
-  if (keyVal != null && keyVal !== "") body.vqa_api_key = keyVal;
+  const keyEl = $("#pref-vqa-api-key");
+  const keyVal = keyEl?.value;
+  if (keyVal != null && keyVal !== VQA_KEY_MASK) {
+    // Empty clears the saved key (turns off AI support); any other value replaces it.
+    body.vqa_api_key = keyVal;
+  }
+  setThumbCropPref(!!$("#pref-thumb-crop")?.checked);
   if (saveBtn) saveBtn.disabled = true;
   try {
     const s = await api("/api/settings", { method: "POST", body: JSON.stringify(body) });
     applyCachedSettings(s);
     $("#prefs-dialog")?.close();
     if ($("#lightbox")?.open) syncLightboxVqa(lightboxCurrentPhoto());
-    await refreshExpandedBranches(["date"]);
+    await refreshExpandedBranches(["dates"]);
+    await reloadBrowseGallery();
   } catch (ex) {
     if (err) {
       err.textContent = ex.message || "Save failed";
@@ -1379,6 +2221,10 @@ $("#prefs-form")?.addEventListener("submit", async (e) => {
 let photoMap = null;
 let photoMapCluster = null;
 let photoMapLoaded = false;
+/** @type {Promise<void> | null} */
+let photoMapLoadInFlight = null;
+/** Re-run loadMap after the in-flight request (scope often arrives mid-fetch). */
+let photoMapReloadQueued = false;
 /** @type {Array<[number, number]> | null} */
 let photoMapBounds = null;
 /** @type {L.Rectangle | null} */
@@ -1391,13 +2237,41 @@ let mapRegionCount = 0;
 /** @type {L.LatLngBounds | null} */
 let mapRegionBounds = null;
 let mapRegionApplyInProgress = false;
+let mapPinJustDragged = false;
+
+/** Leaflet zoom for a shared pin cluster (~subcontinent / large region). */
+const MAP_SINGLE_LOCATION_ZOOM = 4;
+
+function mapBoundsAreSingleLocation(bounds) {
+  if (!bounds?.length) return false;
+  const [lat0, lon0] = bounds[0];
+  const eps = 1e-5;
+  return bounds.every(
+    ([lat, lon]) => Math.abs(lat - lat0) < eps && Math.abs(lon - lon0) < eps
+  );
+}
+
+function fitMapLatLngs(latlngs, { padding = [36, 36], maxZoom = 17 } = {}) {
+  if (!photoMap || !latlngs?.length) return;
+  if (mapBoundsAreSingleLocation(latlngs.map((ll) => [ll.lat ?? ll[0], ll.lng ?? ll[1]]))) {
+    const first = latlngs[0];
+    const lat = first.lat ?? first[0];
+    const lon = first.lng ?? first[1];
+    photoMap.setView([lat, lon], MAP_SINGLE_LOCATION_ZOOM);
+    return;
+  }
+  photoMap.fitBounds(L.latLngBounds(latlngs), { padding, maxZoom });
+}
 
 function fitPhotoMapToPins() {
   if (!photoMap) return;
   const run = () => {
     photoMap.invalidateSize();
     if (photoMapBounds?.length) {
-      photoMap.fitBounds(photoMapBounds, { padding: [36, 36], maxZoom: 17 });
+      fitMapLatLngs(
+        photoMapBounds.map(([lat, lon]) => L.latLng(lat, lon)),
+        { padding: [36, 36], maxZoom: 17 }
+      );
     }
   };
   requestAnimationFrame(() => setTimeout(run, 50));
@@ -1422,7 +2296,7 @@ function drawMapSelectRect(bounds) {
 function mapStatusIdleText() {
   const n = photoMapCluster?.getLayers()?.length ?? 0;
   if (!n) return null;
-  return `${n} photo${n === 1 ? "" : "s"} on map · Shift-drag to select a region`;
+  return `${n} photo${n === 1 ? "" : "s"} on map · Drag a pin to set GPS · Shift-drag to select`;
 }
 
 function clearMapRegionSelection({ clearGallerySelection = false } = {}) {
@@ -1475,31 +2349,68 @@ function applyMapRegionBounds(bounds, { additive = false } = {}) {
   }
 }
 
+function mapPhotosFromMarkers(markers) {
+  const photos = (markers || [])
+    .map((m) => m.options?.photo)
+    .filter((p) => p?.id != null);
+  photos.sort((a, b) => {
+    const ak = isClusterKeeper(a) ? 0 : 1;
+    const bk = isClusterKeeper(b) ? 0 : 1;
+    if (ak !== bk) return ak - bk;
+    return (Number(b.id) || 0) - (Number(a.id) || 0);
+  });
+  return photos;
+}
+
+function openMapLightbox(photos, startPhoto) {
+  if (!photos?.length) return;
+  const p = startPhoto || photos[0];
+  const idx = Math.max(
+    0,
+    photos.findIndex((x) => x.id === p.id)
+  );
+  const cur = photos[idx] || p;
+  openLightbox({
+    src: `/api/original/${cur.id}`,
+    orientation: cur.orientation,
+    mirrored: isMirrored(cur),
+    photo: cur,
+    group: photos.map((x) => ({
+      src: `/api/original/${x.id}`,
+      orientation: x.orientation,
+      mirrored: isMirrored(x),
+      photo: x,
+    })),
+    groupIndex: idx,
+  });
+}
+
 function photoPinIcon(photo) {
   const removed = photo.culled ? " removed" : "";
   const style = orientationStyle(photo);
   return L.divIcon({
     className: `photo-pin${removed}`,
-    html: `<img src="/api/thumb/${photo.id}" alt="" loading="lazy"${style ? ` style="${style}"` : ""} />`,
-    iconSize: [44, 44],
-    iconAnchor: [22, 44],
-    popupAnchor: [0, -40],
+    html: `<img src="/api/thumb/${photo.id}" alt="" draggable="false" loading="lazy"${style ? ` style="${style}"` : ""} />`,
+    iconSize: [28, 28],
+    iconAnchor: [14, 28],
+    popupAnchor: [0, -26],
   });
 }
 
-/** Wider clusters when zoomed out; tighter (then off) when zoomed in. */
+/** Wider clusters when zoomed out; keep nearby pins stacked at all zooms. */
 function photoClusterRadius(zoom) {
   if (zoom <= 3) return 100;
   if (zoom <= 6) return 80;
   if (zoom <= 10) return 60;
-  if (zoom <= 14) return 45;
-  return 30;
+  if (zoom <= 14) return 50;
+  return 40;
 }
 
 function photoClusterIcon(cluster) {
+  const kids = cluster.getAllChildMarkers() || [];
   const count = cluster.getChildCount();
-  const first = cluster.getAllChildMarkers()[0];
-  const thumbId = first?.options?.photoId;
+  const keeper = kids.find((m) => isClusterKeeper(m.options?.photo)) || kids[0];
+  const thumbId = keeper?.options?.photoId;
   const size = count < 10 ? "small" : count < 100 ? "medium" : "large";
   const thumb = thumbId
     ? `<img class="photo-cluster-thumb" src="/api/thumb/${thumbId}" alt="" loading="lazy" />`
@@ -1507,8 +2418,8 @@ function photoClusterIcon(cluster) {
   return L.divIcon({
     className: `photo-cluster photo-cluster-${size}`,
     html: `${thumb}<span class="photo-cluster-count">${count}</span>`,
-    iconSize: [48, 48],
-    iconAnchor: [24, 48],
+    iconSize: [32, 32],
+    iconAnchor: [16, 32],
   });
 }
 
@@ -1530,15 +2441,407 @@ function ensurePhotoMap() {
   photoMapCluster = L.markerClusterGroup({
     showCoverageOnHover: false,
     maxClusterRadius: photoClusterRadius,
-    disableClusteringAtZoom: 17,
-    spiderfyOnMaxZoom: true,
-    zoomToBoundsOnClick: true,
+    spiderfyOnMaxZoom: false,
+    zoomToBoundsOnClick: false,
     iconCreateFunction: photoClusterIcon,
   });
   photoMap.addLayer(photoMapCluster);
+  photoMapCluster.on("clustermouseover", (e) => {
+    const cluster = e.layer;
+    const kids = cluster.getAllChildMarkers?.() || [];
+    const first =
+      kids.find((m) => isClusterKeeper(m.options?.photo))?.options?.photo ||
+      kids[0]?.options?.photo;
+    if (!first) return;
+    cluster.unbindTooltip();
+    cluster.bindTooltip(mapPinHoverHtml(first, { count: kids.length }), {
+      direction: "top",
+      offset: [0, -32],
+      opacity: 1,
+      className: "map-pin-tip-wrap",
+    }).openTooltip();
+  });
+  photoMapCluster.on("clusterclick", (e) => {
+    L.DomEvent.stop(e.originalEvent);
+    mapPinJustDragged = true;
+    setTimeout(() => {
+      mapPinJustDragged = false;
+    }, 0);
+    const kids = e.layer.getAllChildMarkers?.() || [];
+    const photos = mapPhotosFromMarkers(kids);
+    if (!photos.length) return;
+    openMapLightbox(photos, photos[0]);
+  });
   bindMapRegionSelect(photoMap);
   setTimeout(() => photoMap.invalidateSize(), 50);
   return photoMap;
+}
+
+function patchPhotoCoords(photo, lat, lon, coordSource = "manual") {
+  if (!photo) return;
+  const has = lat != null && lon != null;
+  photo.lat = has ? lat : null;
+  photo.lon = has ? lon : null;
+  photo.coord_source = has ? coordSource : null;
+  photo.gps = has && coordSource === "exif" ? 1 : 0;
+}
+
+function patchPhotoPlaceFields(photo, place) {
+  if (!photo || !place) return;
+  photo.place_label = place.place_label || null;
+  photo.venue = place.venue || null;
+  photo.city = place.city || null;
+  photo.region = place.region || null;
+  photo.country = place.country || null;
+}
+
+function patchLocalCoordsById(id, lat, lon, coordSource = "manual", place = null) {
+  if (id == null) return;
+  const patch = (p) => {
+    if (!p) return;
+    patchPhotoCoords(p, lat, lon, coordSource);
+    if (place) patchPhotoPlaceFields(p, place);
+  };
+  for (const p of browseItems) if (p.id === id) patch(p);
+  for (const p of browseItemsFull) if (p.id === id) patch(p);
+  const dupe = dupePhotosById?.get?.(id);
+  if (dupe) patch(dupe);
+  const lb = typeof lightboxCurrentPhoto === "function" ? lightboxCurrentPhoto() : null;
+  if (lb?.id === id) {
+    patch(lb);
+    renderLightboxMeta(lb);
+    syncLightboxShowMapBtn(lb);
+    refreshLightboxFileMeta(lb);
+    const placeEl = $("#lightbox-place");
+    if (placeEl && place) placeEl.value = (lb.place_label || "").trim();
+  }
+}
+
+function syncPhotoMapBoundsFromMarkers() {
+  if (!photoMapCluster) {
+    photoMapBounds = null;
+    return;
+  }
+  const bounds = [];
+  for (const m of photoMapCluster.getLayers()) {
+    const ll = m.getLatLng();
+    bounds.push([ll.lat, ll.lng]);
+  }
+  photoMapBounds = bounds.length ? bounds : null;
+}
+
+function mapPinHoverHtml(photo, { count = 1 } = {}) {
+  if (!photo?.id) return "";
+  const name = escapeHtml(basename(photo.path || photo.rel_path) || "Photo");
+  const style = orientationStyle(photo);
+  const bits = [
+    count > 1 ? `${count} photos` : "",
+    photo.taken_at ? String(photo.taken_at).slice(0, 10) : "undated",
+    photo.place_label || "",
+    photo.camera || "",
+    formatDims(photo) !== "—" ? formatDims(photo) : "",
+  ].filter(Boolean);
+  if (photo.lat != null && photo.lon != null) {
+    bits.push(`${Number(photo.lat).toFixed(4)}, ${Number(photo.lon).toFixed(4)}`);
+  }
+  return `<div class="map-pin-tip">
+    <img src="/api/thumb/${photo.id}" alt="" draggable="false"${style ? ` style="${style}"` : ""} />
+    <div class="map-pin-tip-meta">
+      <strong>${name}</strong>
+      ${bits.map((b) => `<span>${escapeHtml(b)}</span>`).join("")}
+    </div>
+  </div>`;
+}
+
+function bindMapPinTooltip(marker) {
+  const photo = marker.options?.photo;
+  if (!photo) return;
+  marker.unbindTooltip();
+  marker.bindTooltip(mapPinHoverHtml(photo), {
+    direction: "top",
+    offset: [0, -28],
+    opacity: 1,
+    className: "map-pin-tip-wrap",
+  });
+}
+
+function mapMarkerByPhotoId(id) {
+  if (id == null || !photoMapCluster) return null;
+  for (const m of photoMapCluster.getLayers()) {
+    if (m.options?.photoId === id) return m;
+  }
+  return null;
+}
+
+function mapMarkersForPinDrag(primary) {
+  const primaryId = primary.options?.photoId;
+  const selected = typeof selectedBrowsePhotos === "function" ? selectedBrowsePhotos() : [];
+  const ids = new Set(selected.map((p) => p.id).filter((id) => id != null));
+  if (primaryId == null || !ids.has(primaryId) || ids.size < 2) return [primary];
+  const found = [];
+  for (const m of photoMapCluster?.getLayers() || []) {
+    if (ids.has(m.options?.photoId)) found.push(m);
+  }
+  return found.length ? found : [primary];
+}
+
+let mapPinConfirmResolve = null;
+
+function settleMapPinConfirm(ok) {
+  $("#map-pin-confirm")?.close();
+  const resolve = mapPinConfirmResolve;
+  mapPinConfirmResolve = null;
+  if (resolve) resolve(!!ok);
+}
+
+function confirmMapPinUpdate(message) {
+  const dlg = $("#map-pin-confirm");
+  const msg = $("#map-pin-confirm-msg");
+  if (!dlg || !msg) return Promise.resolve(window.confirm(message));
+  msg.textContent = message;
+  return new Promise((resolve) => {
+    mapPinConfirmResolve = resolve;
+    dlg.showModal();
+  });
+}
+
+async function previewReversePlace(lat, lon) {
+  try {
+    const res = await api(
+      `/api/geocode/reverse?lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lon)}`
+    );
+    return (res?.place_label || "").trim();
+  } catch {
+    return "";
+  }
+}
+
+function mapDropLatLngFromEvent(e) {
+  const mapEl = $("#photo-map");
+  if (!photoMap || !mapEl) return null;
+  if (!$("#tab-map")?.classList.contains("active")) return null;
+  const rect = mapEl.getBoundingClientRect();
+  if (
+    e.clientX < rect.left ||
+    e.clientX > rect.right ||
+    e.clientY < rect.top ||
+    e.clientY > rect.bottom
+  ) {
+    return null;
+  }
+  return photoMap.containerPointToLatLng(
+    L.point(e.clientX - rect.left, e.clientY - rect.top)
+  );
+}
+
+async function applyMapPhotoDrop(photos, latlng) {
+  const list = (photos || []).filter((p) => p?.id != null);
+  if (!list.length || !latlng) return;
+  const lat = latlng.lat;
+  const lon = latlng.lng;
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+  const status = $("#map-status");
+  if (status) status.textContent = "Checking location…";
+  const placeLabel = await previewReversePlace(lat, lon);
+  const n = list.length;
+  const coord = `${Number(lat).toFixed(5)}, ${Number(lon).toFixed(5)}`;
+  const who = n === 1 ? "this photo" : `${n} photos`;
+  const where = placeLabel ? `${placeLabel} (${coord})` : coord;
+  const ok = await confirmMapPinUpdate(`Set location of ${who} to ${where}?`);
+  if (!ok) {
+    const idle = mapStatusIdleText();
+    if (status && idle) status.textContent = idle;
+    return;
+  }
+  if (status) status.textContent = "Saving coordinates…";
+  try {
+    const updates = list.map((photo) => ({
+      id: photo.id,
+      lat,
+      lon,
+      photo,
+      marker: mapMarkerByPhotoId(photo.id),
+    }));
+    await savePhotoCoordsBatch(updates);
+    const missingPins = updates.some((u) => !u.marker);
+    if (missingPins) {
+      photoMapLoaded = false;
+      await loadMap(true);
+    } else if (typeof photoMapCluster.refreshClusters === "function") {
+      photoMapCluster.refreshClusters();
+      syncPhotoMapBoundsFromMarkers();
+    }
+    if (typeof refreshExpandedBranches === "function") {
+      refreshExpandedBranches(["places"]).catch(() => {});
+    }
+    if (status) {
+      status.textContent = placeLabel ? `Saved ${placeLabel}` : `Saved ${coord}`;
+      setTimeout(() => {
+        if (status.textContent?.startsWith("Saved ")) {
+          const idle = mapStatusIdleText();
+          if (idle) status.textContent = idle;
+        }
+      }, 2000);
+    }
+  } catch (err) {
+    if (status) status.textContent = err.message || "Could not save coordinates";
+  }
+}
+
+async function savePhotoCoordsBatch(updates) {
+  if (!updates?.length) return { ok: false };
+  const first = updates[0];
+  const same = updates.every(
+    (u) => u.lat === first.lat && u.lon === first.lon
+  );
+  const groups = same
+    ? [updates]
+    : updates.map((u) => [u]);
+  let lastRes = null;
+  for (const group of groups) {
+    const res = await api("/api/photos/properties", {
+      method: "POST",
+      body: JSON.stringify({
+        photo_ids: group.map((u) => u.id),
+        properties: { lat: group[0].lat, lon: group[0].lon },
+      }),
+    });
+    if (res.errors?.length && !res.updated) {
+      throw new Error(res.errors[0].error || "Could not save coordinates");
+    }
+    lastRes = res;
+    const newLat = res.lat ?? group[0].lat;
+    const newLon = res.lon ?? group[0].lon;
+    const src = res.coord_source || "manual";
+    const place = res.place || null;
+    for (const u of group) {
+      patchPhotoCoords(u.photo, newLat, newLon, src);
+      if (place) patchPhotoPlaceFields(u.photo, place);
+      patchLocalCoordsById(u.id, newLat, newLon, src, place);
+      if (u.marker) {
+        u.marker.setLatLng([newLat, newLon]);
+        bindMapPinTooltip(u.marker);
+      }
+    }
+  }
+  if (typeof renderBrowseResults === "function" && browseItems.length) {
+    renderBrowseResults();
+  }
+  return { ok: true, res: lastRes };
+}
+
+async function saveMapPinCoords(markers) {
+  const list = (markers || []).filter(Boolean);
+  const status = $("#map-status");
+  const revert = () => {
+    for (const marker of list) {
+      if (marker._pinOrigin) marker.setLatLng(marker._pinOrigin);
+    }
+    if (typeof photoMapCluster.refreshClusters === "function") {
+      photoMapCluster.refreshClusters(list);
+    }
+  };
+  const updates = [];
+  for (const marker of list) {
+    const photo = marker.options?.photo;
+    const id = marker.options?.photoId ?? photo?.id;
+    const ll = marker.getLatLng();
+    if (id == null || !Number.isFinite(ll.lat) || !Number.isFinite(ll.lng)) {
+      revert();
+      return;
+    }
+    updates.push({ id, lat: ll.lat, lon: ll.lng, marker, photo });
+  }
+  if (!updates.length) {
+    revert();
+    return;
+  }
+  const primary = updates[0];
+  if (status) status.textContent = "Checking location…";
+  const placeLabel = await previewReversePlace(primary.lat, primary.lon);
+  const n = updates.length;
+  const coord = `${Number(primary.lat).toFixed(5)}, ${Number(primary.lon).toFixed(5)}`;
+  const who = n === 1 ? "this photo" : `${n} photos`;
+  const where = placeLabel ? `${placeLabel} (${coord})` : coord;
+  const ok = await confirmMapPinUpdate(`Update location of ${who} to ${where}?`);
+  if (!ok) {
+    revert();
+    const idle = mapStatusIdleText();
+    if (status && idle) status.textContent = idle;
+    return;
+  }
+  if (status) status.textContent = "Saving coordinates…";
+  try {
+    await savePhotoCoordsBatch(updates);
+    if (typeof photoMapCluster.refreshClusters === "function") {
+      photoMapCluster.refreshClusters(list);
+    }
+    syncPhotoMapBoundsFromMarkers();
+    if (typeof refreshExpandedBranches === "function") {
+      refreshExpandedBranches(["places"]).catch(() => {});
+    }
+    if (status) {
+      status.textContent = placeLabel
+        ? `Saved ${placeLabel}`
+        : `Saved ${coord}`;
+      setTimeout(() => {
+        if (status.textContent?.startsWith("Saved ")) {
+          const idle = mapStatusIdleText();
+          if (idle) status.textContent = idle;
+        }
+      }, 2000);
+    }
+  } catch (err) {
+    revert();
+    if (status) status.textContent = err.message || "Could not save coordinates";
+  }
+}
+
+function bindMapPinDrag(marker) {
+  marker.on("mousedown", (e) => {
+    if (!marker.dragging) return;
+    if (e.originalEvent?.shiftKey) marker.dragging.disable();
+    else if (!marker.dragging.enabled()) marker.dragging.enable();
+  });
+  marker.on("mouseup", () => {
+    if (marker.dragging && !marker.dragging.enabled()) marker.dragging.enable();
+  });
+  marker.on("dragstart", () => {
+    marker.closeTooltip?.();
+    const group = mapMarkersForPinDrag(marker);
+    marker._pinGroup = group;
+    for (const m of group) {
+      m._pinMoved = false;
+      m._pinOrigin = m.getLatLng();
+    }
+    mapPinJustDragged = true;
+    photoMap?.getContainer()?.classList.add("map-pin-dragging");
+  });
+  marker.on("drag", () => {
+    marker._pinMoved = true;
+    const origin = marker._pinOrigin;
+    if (!origin) return;
+    const now = marker.getLatLng();
+    const dLat = now.lat - origin.lat;
+    const dLng = now.lng - origin.lng;
+    for (const m of marker._pinGroup || []) {
+      if (m === marker) continue;
+      const o = m._pinOrigin;
+      if (!o) continue;
+      m._pinMoved = true;
+      m.setLatLng([o.lat + dLat, o.lng + dLng]);
+    }
+  });
+  marker.on("dragend", () => {
+    photoMap?.getContainer()?.classList.remove("map-pin-dragging");
+    setTimeout(() => {
+      mapPinJustDragged = false;
+    }, 0);
+    const group = marker._pinGroup || [marker];
+    marker._pinGroup = null;
+    if (!group.some((m) => m._pinMoved)) return;
+    saveMapPinCoords(group);
+  });
 }
 
 function bindMapRegionSelect(map) {
@@ -1594,7 +2897,7 @@ function bindMapRegionSelect(map) {
   });
 
   map.on("click", () => {
-    if (suppressClick || mapSelectDrawing) return;
+    if (suppressClick || mapSelectDrawing || mapPinJustDragged) return;
     if (!mapRegionBounds && !mapRegionActive) return;
     clearMapRegionSelection({ clearGallerySelection: true });
   });
@@ -1617,79 +2920,125 @@ async function loadMap(force = false) {
     fitPhotoMapToPins();
     return;
   }
-  status.textContent = "Loading pins…";
-  try {
-    const scopeIds = browseScopedPhotoIds();
-    photoMapCluster.clearLayers();
-    photoMapBounds = null;
-    clearMapSelectRect();
-    if (!scopeIds.size) {
-      clearMapRegionSelection();
-      status.textContent = "Select items in the tree to show photos on the map.";
-      photoMapLoaded = true;
-      fitPhotoMapToPins();
-      return;
-    }
-    const q = includeCulled() ? "?include_culled=true" : "";
-    const all = await api(`/api/map/photos${q}`);
-    const photos = filterByPhotoVisibility(
-      all.filter((p) => scopeIds.has(p.id) && isClusterKeeper(p)),
-      { respectSelection: true }
-    );
-    if (!photos.length) {
-      status.textContent = "No GPS photos in the current selection.";
-      photoMapLoaded = true;
-      fitPhotoMapToPins();
-      return;
-    }
-    const bounds = [];
-    const markers = [];
-    for (const p of photos) {
-      const lat = Number(p.lat);
-      const lon = Number(p.lon);
-      if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
-      bounds.push([lat, lon]);
-      const marker = L.marker([lat, lon], {
-        icon: photoPinIcon(p),
-        photoId: p.id,
-        title: [p.place_label, p.taken_at?.slice(0, 10)].filter(Boolean).join(" · "),
-      });
-      marker.on("click", () => {
-        openLightbox({
-          src: `/api/original/${p.id}`,
-          orientation: p.orientation,
-          mirrored: isMirrored(p),
-          photo: p,
-          group: photos.map((x) => ({
-            src: `/api/original/${x.id}`,
-            orientation: x.orientation,
-            mirrored: isMirrored(x),
-            photo: x,
-          })),
-          groupIndex: photos.indexOf(p),
-        });
-      });
-      markers.push(marker);
-    }
-    photoMapCluster.addLayers(markers);
-    photoMapBounds = bounds.length ? bounds : null;
-    if (mapRegionActive && mapRegionBounds) {
-      drawMapSelectRect(mapRegionBounds);
-      status.textContent = mapRegionCount
-        ? `${mapRegionCount} photo${mapRegionCount === 1 ? "" : "s"} selected · click map to clear`
-        : "No photos in that region";
-    } else {
-      status.textContent = `${photos.length} photo${photos.length === 1 ? "" : "s"} on map · Shift-drag to select a region`;
-    }
-    photoMapLoaded = true;
-    fitPhotoMapToPins();
-  } catch (err) {
-    status.textContent = err.message;
+  // Gallery scope often fills in while /api/map/photos is in flight — queue a
+  // reload instead of dropping the forced refresh.
+  if (photoMapLoadInFlight) {
+    if (force) photoMapReloadQueued = true;
+    return photoMapLoadInFlight;
   }
+  status.innerHTML = loadingMarkup("Loading pins", "inline");
+  photoMapReloadQueued = false;
+  photoMapLoadInFlight = (async () => {
+    try {
+      const q = includeCulled() ? "?include_culled=true" : "";
+      const all = await api(`/api/map/photos${q}`);
+      // Re-read after await: tree/gallery may have loaded during the fetch.
+      const scopeIds = browseScopedPhotoIds();
+      photoMapCluster.clearLayers();
+      photoMapBounds = null;
+      clearMapSelectRect();
+      if (!scopeIds.size) {
+        clearMapRegionSelection();
+        status.textContent = "Select items in the tree to show photos on the map.";
+        photoMapLoaded = true;
+        fitPhotoMapToPins();
+        return;
+      }
+      const photos = filterByAspect(
+        filterByPhotoVisibility(
+          all.filter((p) => scopeIds.has(p.id)),
+          { respectSelection: true }
+        )
+      );
+      if (!photos.length) {
+        status.textContent = "No GPS photos in the current selection.";
+        photoMapLoaded = true;
+        fitPhotoMapToPins();
+        return;
+      }
+      const bounds = [];
+      const markers = [];
+      for (const p of photos) {
+        const lat = Number(p.lat);
+        const lon = Number(p.lon);
+        if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+        bounds.push([lat, lon]);
+        const marker = L.marker([lat, lon], {
+          icon: photoPinIcon(p),
+          photoId: p.id,
+          photo: p,
+          draggable: true,
+          autoPan: true,
+        });
+        bindMapPinDrag(marker);
+        bindMapPinTooltip(marker);
+        marker.on("click", () => {
+          if (marker._pinMoved) {
+            marker._pinMoved = false;
+            return;
+          }
+          openMapLightbox(photos, p);
+        });
+        markers.push(marker);
+      }
+      photoMapCluster.addLayers(markers);
+      photoMapBounds = bounds.length ? bounds : null;
+      if (mapRegionActive && mapRegionBounds) {
+        drawMapSelectRect(mapRegionBounds);
+        status.textContent = mapRegionCount
+          ? `${mapRegionCount} photo${mapRegionCount === 1 ? "" : "s"} selected · click map to clear`
+          : "No photos in that region";
+      } else {
+        status.textContent = mapStatusIdleText() || `${photos.length} photos on map`;
+      }
+      photoMapLoaded = true;
+      fitPhotoMapToPins();
+    } catch (err) {
+      status.textContent = err.message;
+    } finally {
+      photoMapLoadInFlight = null;
+      if (photoMapReloadQueued) {
+        photoMapReloadQueued = false;
+        void loadMap(true);
+      }
+    }
+  })();
+  return photoMapLoadInFlight;
 }
 
 
 $("#search-form")?.addEventListener("submit", runSearch);
+$("#aspect-filter")?.addEventListener("change", async () => {
+  syncAspectFilterStyle();
+  saveAspectFilterPref();
+  setRegroupBusy(true);
+  await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+  try {
+    renderBrowseResults();
+    await refreshScopedWorkspaceViews();
+  } finally {
+    setRegroupBusy(false);
+  }
+});
+
+$("#btn-pair-device")?.addEventListener("click", async () => {
+  const btn = $("#btn-pair-device");
+  const status = $("#index-status");
+  if (!btn) return;
+  btn.disabled = true;
+  try {
+    const src = await api("/api/sources/pair-device", {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    loadSources();
+    openPairDeviceDialog(src);
+  } catch (err) {
+    if (status) status.textContent = err.message;
+  } finally {
+    btn.disabled = false;
+  }
+});
 
 $("#btn-add-source")?.addEventListener("click", async () => {
   const btn = $("#btn-add-source");
@@ -1714,16 +3063,57 @@ $("#btn-add-source")?.addEventListener("click", async () => {
   }
 });
 
-const CLUSTER_LEVEL_LABELS = [
-  "Duplicates",
-  "File formats",
-  "Framing",
-  "Burst",
-  "Same",
-  "Similar",
-  "Related",
-  "Familiar",
-];
+$("#btn-import-zip")?.addEventListener("click", async () => {
+  const btn = $("#btn-import-zip");
+  if (!btn) return;
+  btn.disabled = true;
+  const status = $("#index-status");
+  try {
+    const picked = await api("/api/pick-zip", { method: "POST" });
+    if (picked.cancelled || !picked.path) return;
+    const started = await api("/api/sources/import-zip", {
+      method: "POST",
+      body: JSON.stringify({ zip_path: picked.path }),
+    });
+    if (started.cancelled) return;
+    lastIndexStatus = { ...(lastIndexStatus || {}), import: started };
+    loadSources();
+    pollIndex();
+  } catch (err) {
+    if (status) status.textContent = err.message;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+const CLUSTER_METHOD_KEY = "fotoman.clusterMethod";
+const CLUSTER_METHODS = new Set(["HASH_VECTOR", "SCENE_MATCH"]);
+
+function clusterMethodFromSelect() {
+  const v = String($("#cluster-method")?.value || "HASH_VECTOR").toUpperCase();
+  return CLUSTER_METHODS.has(v) ? v : "HASH_VECTOR";
+}
+
+function loadClusterMethodPref() {
+  const el = $("#cluster-method");
+  if (!el) return;
+  try {
+    const saved = localStorage.getItem(CLUSTER_METHOD_KEY);
+    if (saved && CLUSTER_METHODS.has(saved)) el.value = saved;
+  } catch (_) { /* ignore */ }
+}
+
+function persistClusterMethodPref() {
+  try {
+    localStorage.setItem(CLUSTER_METHOD_KEY, clusterMethodFromSelect());
+  } catch (_) { /* ignore */ }
+}
+
+/** Slider is Cluster range (small→large left→right) = internal level 0=strict…7=loose. */
+function clusterLevelFromSlider() {
+  const v = Number($("#cluster-level")?.value);
+  return Math.max(0, Math.min(7, Number.isFinite(v) ? v : 0));
+}
 
 function clusterLevelConfig(level) {
   const n = Math.max(0, Math.min(7, Number(level) || 0));
@@ -1737,61 +3127,139 @@ function clusterLevelConfig(level) {
   };
 }
 
-function syncClusterLevelLabel() {
-  const slider = $("#cluster-level");
-  const label = $("#cluster-level-label");
-  if (!slider || !label) return;
-  const n = Math.max(0, Math.min(7, Number(slider.value) || 0));
-  label.textContent = CLUSTER_LEVEL_LABELS[n] || String(n);
-}
-
-function syncClusterLevelControls(workspaceView) {
+function syncClusterLevelControls(show) {
   const control = $(".cluster-level-control");
-  if (control) control.hidden = workspaceView !== "dupes";
+  if (control) control.hidden = !show;
 }
 
-function setRegroupBusy(busy) {
+function clusterRangeRegroupsView() {
+  return isDupesWorkspace() || clusterRangeAffectsBrowse();
+}
+
+function setRegroupBusy(busy, { onWatermark = false } = {}) {
   const overlay = $("#regroup-overlay");
-  if (overlay) overlay.hidden = !busy;
+  if (!overlay) return;
+  if (busy) {
+    const panel = document.querySelector(".panel.active");
+    if (panel && overlay.parentElement !== panel) panel.appendChild(overlay);
+  }
+  overlay.classList.toggle("on-watermark", !!(busy && onWatermark));
+  overlay.hidden = !busy;
 }
 
+function showBrowseLoading() {
+  const results = $("#browse-results");
+  if (results) {
+    results.className = "";
+    results.innerHTML = "";
+  }
+  setRegroupBusy(true, { onWatermark: true });
+}
+
+/** True when Clusters view is showing a preview not yet written to photo_groups. */
+let clustersPreviewDirty = false;
+/** Last preview/persist items — used to update gallery keepers without waiting on DB. */
+let lastClusterPreviewItems = null;
 let regroupSeq = 0;
 
-async function regroupClusters() {
+function applyClusterAssignmentsToBrowseItems(items) {
+  if (!Array.isArray(items)) return;
+  const byId = new Map();
+  for (const g of items) {
+    for (const m of g.members || []) {
+      if (m?.id != null) byId.set(m.id, m);
+    }
+  }
+  const scopeIds = browseScopedPhotoIds();
+  for (const p of browseItems) {
+    if (p?.id == null || !scopeIds.has(p.id)) continue;
+    const m = byId.get(p.id);
+    if (m) {
+      p.group_id = m.group_id;
+      p.is_keeper = !!m.is_keeper;
+    } else {
+      p.group_id = null;
+      p.is_keeper = true;
+    }
+  }
+}
+
+async function persistClustersPreview() {
+  debouncedRegroup.cancel?.();
+  if (!clustersPreviewDirty) {
+    setRegroupBusy(false);
+    return;
+  }
+  await regroupClusters({ persist: true, render: false });
+}
+
+function applyRegroupedClustersToGallery() {
+  const visible = new Set(browseDisplayItems().map(browseItemKey));
+  browseSelected = new Set([...browseSelected].filter((k) => visible.has(k)));
+  renderBrowseResults();
+}
+
+async function regroupClusters({ persist = false, render = true } = {}) {
   const seq = ++regroupSeq;
-  const level = Number($("#cluster-level")?.value);
+  const level = clusterLevelFromSlider();
   const { exact, formatted, near, threshold } = clusterLevelConfig(level);
   const photo_ids = [...browseScopedPhotoIds()];
   const list = $("#dupe-list");
   if (!photo_ids.length) {
+    clustersPreviewDirty = false;
+    lastClusterPreviewItems = [];
     setRegroupBusy(false);
-    if (list) list.innerHTML = `<p class="muted">Select items in the tree to show clusters.</p>`;
+    if (render && isDupesWorkspace() && list) {
+      list.innerHTML = `<p class="muted">Select items in the tree to show clusters.</p>`;
+    }
     dupePhotosById = new Map();
     dupeSelected.clear();
     syncDupeToolbar();
+    if (render) renderBrowseTimeline([]);
     return;
   }
-  setRegroupBusy(true);
-  dupeSelected.clear();
-  syncDupeToolbar();
+  // Overlay while the grouping UI is on screen; background persist stays silent.
+  if (render && clusterRangeRegroupsView()) setRegroupBusy(true);
+  else setRegroupBusy(false);
+  if (render && isDupesWorkspace()) {
+    dupeSelected.clear();
+    syncDupeToolbar();
+  }
   try {
-    await api("/api/duplicates/rebuild", {
+    const result = await api("/api/duplicates/rebuild", {
       method: "POST",
       body: JSON.stringify({
         threshold: near ? threshold : undefined,
         exact,
         formatted,
         near,
+        clustering: clusterMethodFromSelect(),
         photo_ids,
         include_culled: includeCulled(),
+        persist,
       }),
     });
     if (seq !== regroupSeq) return;
-    await loadDupes();
-    refreshStats();
+    clustersPreviewDirty = !persist;
+    lastClusterPreviewItems = result.items || [];
+    if (persist) {
+      applyClusterAssignmentsToBrowseItems(lastClusterPreviewItems);
+      refreshStats();
+    } else if (render && clusterRangeAffectsBrowse()) {
+      applyClusterAssignmentsToBrowseItems(lastClusterPreviewItems);
+    }
+    if (render) {
+      if (isDupesWorkspace()) renderDupeGroups(lastClusterPreviewItems);
+      else if (clusterRangeAffectsBrowse()) applyRegroupedClustersToGallery();
+    }
   } catch (err) {
-    if (seq === regroupSeq && list) {
-      list.innerHTML = `<p class="muted">Regroup failed.</p>`;
+    if (seq === regroupSeq && render) {
+      if (isDupesWorkspace() && list) {
+        list.innerHTML = `<p class="muted">Regroup failed.</p>`;
+      } else if (clusterRangeAffectsBrowse()) {
+        const root = $("#browse-results");
+        if (root) root.innerHTML = `<p class="muted">Regroup failed.</p>`;
+      }
     }
     console.error("regroup failed", err);
   } finally {
@@ -1801,33 +3269,62 @@ async function regroupClusters() {
 
 function debounce(fn, ms) {
   let t;
-  return (...args) => {
+  const wrapped = (...args) => {
     clearTimeout(t);
     t = setTimeout(() => fn(...args), ms);
   };
+  wrapped.cancel = () => clearTimeout(t);
+  return wrapped;
 }
 
-const debouncedRegroup = debounce(regroupClusters, 280);
+const debouncedRegroup = debounce(() => {
+  if (isDupesWorkspace()) regroupClusters({ persist: false });
+  else if (clusterRangeAffectsBrowse()) regroupClusters({ persist: true });
+  else setRegroupBusy(false);
+}, 120);
 
 $("#cluster-level")?.addEventListener("input", () => {
-  syncClusterLevelLabel();
+  if (!clusterRangeRegroupsView()) return;
+  setRegroupBusy(true);
   debouncedRegroup();
 });
-syncClusterLevelLabel();
+$("#cluster-method")?.addEventListener("change", () => {
+  persistClusterMethodPref();
+  if (!clusterRangeRegroupsView()) return;
+  setRegroupBusy(true);
+  debouncedRegroup();
+});
+loadClusterMethodPref();
 
 refreshStats();
 loadSources();
 pollIndex();
 pollFacesStatus();
+setInterval(() => {
+  pollIndex().catch(() => {});
+}, 10000);
 
 // ── SSE: live updates from server ───────────────────────────────────────────
 /** Apply a fresh sources payload; full rebuild only if the archive set changed. */
 async function applySourcesLive(sources) {
-  const prevIds = (lastSources || []).map((s) => s.id).join(",");
+  const prev = lastSources || [];
+  const prevIds = prev.map((s) => s.id).join(",");
   const nextIds = (sources || []).map((s) => s.id).join(",");
+  const prevExists = Object.fromEntries(prev.map((s) => [s.id, !!s.exists]));
+  const mountChanged = (sources || []).some((s) => {
+    const was = prevExists[s.id];
+    return was !== undefined && was !== !!s.exists;
+  });
   lastSources = sources;
-  if (prevIds !== nextIds || !$("#source-list")?.querySelector("li[data-source-id]")) {
+  if (
+    prevIds !== nextIds ||
+    mountChanged ||
+    !$("#source-list")?.querySelector("tr[data-source-id]")
+  ) {
     await loadSources();
+    if (prevIds !== nextIds || mountChanged) {
+      refreshExpandedBranches(["volumes"]).catch(() => {});
+    }
     return;
   }
   applyIndexStatusToSources(lastIndexStatus, sources, lastFacesStatus);
@@ -1874,7 +3371,7 @@ async function applySourcesLive(sources) {
 
 // ── Browse tab ──────────────────────────────────────────────────────────────
 
-let browseView = "folders";
+let browseView = "volumes";
 let browseActiveKey = null;
 let browseActiveKeys = [];
 /** @type {Record<string, string[]>} groupBy → selected keys (OR within, AND across) */
@@ -1896,16 +3393,24 @@ let browseSort = { key: "taken_at", dir: "desc" };
 const BROWSE_VIEW_KEY = "fotoman.browseView";
 const BROWSE_GALLERY_KEY = "fotoman.browseGalleryView";
 const BROWSE_TILE_SIZE_KEY = "fotoman.browseTileSize";
+const BROWSE_SELECTION_KEY = "fotoman.browseSelection";
+const ASPECT_FILTER_KEY = "fotoman.aspectFilter";
 const BROWSE_TILE_SIZE_MIN = 64;
 const BROWSE_TILE_SIZE_MAX = 376;
 const BROWSE_TILE_COMPACT_MAX = 120;
 const VALID_BROWSE_VIEWS = new Set([
-  "folders",
-  "date",
-  "camera",
-  "location",
+  "volumes",
+  "collections",
+  "dates",
+  "cameras",
+  "places",
   "people",
 ]);
+const BROWSE_VIEW_ALIASES = {
+  date: "dates",
+  camera: "cameras",
+  location: "places",
+};
 const VALID_GALLERY_VIEWS = new Set(["thumbs", "details"]);
 const MONTH_LABELS = [
   "",
@@ -1929,14 +3434,65 @@ function clampBrowseTileSize(n) {
   return Math.max(BROWSE_TILE_SIZE_MIN, Math.min(BROWSE_TILE_SIZE_MAX, stepped));
 }
 
+function saveBrowseSelectionPref() {
+  try {
+    localStorage.setItem(BROWSE_SELECTION_KEY, JSON.stringify(cloneBrowseSelection()));
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+function loadBrowseSelectionPref() {
+  try {
+    const raw = localStorage.getItem(BROWSE_SELECTION_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const cleaned = {};
+      for (const [gb, keys] of Object.entries(parsed)) {
+        if (!Array.isArray(keys)) continue;
+        cleaned[gb] = keys.map(String);
+      }
+      browseSelectionByGroup = cleaned;
+      syncBrowseActiveFromSelection();
+    }
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+function saveAspectFilterPref() {
+  try {
+    localStorage.setItem(ASPECT_FILTER_KEY, currentAspectFilter());
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+function loadAspectFilterPref() {
+  try {
+    const saved = localStorage.getItem(ASPECT_FILTER_KEY);
+    const el = $("#aspect-filter");
+    if (!el || saved == null) return;
+    const ok = [...el.options].some((o) => o.value === saved);
+    if (ok) el.value = saved;
+  } catch (_) {
+    /* ignore */
+  }
+}
+
 function loadBrowsePrefs() {
   let migratedRemovedBranch = false;
   try {
     const view = localStorage.getItem(BROWSE_VIEW_KEY);
     // Old Removed tree branch → global Removed visibility.
     if (view === "remove") {
-      browseView = "folders";
+      browseView = "volumes";
       migratedRemovedBranch = true;
+    } else if (view === "aspect") {
+      browseView = "volumes";
+    } else if (view && BROWSE_VIEW_ALIASES[view]) {
+      browseView = BROWSE_VIEW_ALIASES[view];
     } else if (view && VALID_BROWSE_VIEWS.has(view)) {
       browseView = view;
     }
@@ -1959,10 +3515,13 @@ function loadBrowsePrefs() {
     savePhotoVisibilityPref();
     saveBrowseViewPref();
   }
+  loadBrowseSelectionPref();
+  loadAspectFilterPref();
   loadPressPrefs();
   syncBrowseTileSizeControl();
   syncPhotoVisibilityButtons();
   syncBrowseNestedOptLabel();
+  syncAspectFilterStyle();
 }
 
 function saveBrowseTileSizePref() {
@@ -1979,10 +3538,13 @@ function syncBrowseTileSizeControl() {
 }
 
 function applyBrowseTileSize() {
-  const root = $("#browse-results");
-  if (!root) return;
-  root.style.setProperty("--browse-tile", `${browseTileSize}px`);
-  root.classList.toggle("is-compact", browseTileSize <= BROWSE_TILE_COMPACT_MAX);
+  const size = `${browseTileSize}px`;
+  const compact = browseTileSize <= BROWSE_TILE_COMPACT_MAX;
+  for (const root of [$("#browse-results"), $("#dupe-list")]) {
+    if (!root) continue;
+    root.style.setProperty("--browse-tile", size);
+    root.classList.toggle("is-compact", compact);
+  }
 }
 
 function setBrowseTileSize(n, { persist = true } = {}) {
@@ -1994,7 +3556,7 @@ function setBrowseTileSize(n, { persist = true } = {}) {
 
 function showMonthDividers() {
   // Search rank order wins; month bands only when browsing normally.
-  return isPressOn($("#browse-show-months")) && !browseSearchActive;
+  return false;
 }
 
 function photoMonthKey(p) {
@@ -2034,8 +3596,12 @@ function saveBrowseGalleryPref() {
 
 function syncBrowseViewButtons() {
   const activePanel = document.querySelector(".panel.active");
-  if (activePanel?.id === "tab-browse") {
-    syncWorkspaceViewButtons(browseGalleryView);
+  if (activePanel?.id === "tab-dupes") {
+    syncWorkspaceViewButtons("compare");
+  } else if (activePanel?.id === "tab-browse") {
+    syncWorkspaceViewButtons(
+      browseGalleryView === "details" ? "details" : "stack"
+    );
   }
 }
 
@@ -2044,13 +3610,14 @@ syncBrowseViewButtons();
 
 const BROWSE_DETAIL_COLS = [
   { key: "name", label: "Name" },
-  { key: "archive", label: "Archive" },
+  { key: "archive", label: "Volume" },
   { key: "path", label: "Path" },
   { key: "taken_at", label: "Date" },
   { key: "camera", label: "Camera" },
   { key: "place", label: "Place" },
   { key: "size", label: "Size" },
   { key: "dims", label: "Dimensions" },
+  { key: "aspect", label: "Aspect" },
 ];
 
 function browseMediaUrls(p) {
@@ -2078,6 +3645,16 @@ function formatBytes(n) {
 function formatDims(p) {
   if (p.width && p.height) return `${p.width}×${p.height}`;
   return "—";
+}
+
+function formatAspect(p) {
+  const labels = {
+    landscape: "Landscape",
+    portrait: "Portrait",
+    square: "Square",
+    panorama: "Panorama",
+  };
+  return labels[photoAspectClass(p)] || "—";
 }
 
 function photoPath(p) {
@@ -2123,6 +3700,15 @@ function browseItemHoverDetail(p) {
   </div>`;
 }
 
+function isCardHoverDetailEvent(e) {
+  return !!e.target.closest(".card-hover-detail, .browse-thumb-detail");
+}
+
+function hoverDetailHasSelection() {
+  const sel = window.getSelection();
+  return !!(sel && sel.toString());
+}
+
 function browseSortValue(p, key) {
   switch (key) {
     case "name":
@@ -2141,6 +3727,8 @@ function browseSortValue(p, key) {
       return Number(p.size) || 0;
     case "dims":
       return (Number(p.width) || 0) * (Number(p.height) || 0);
+    case "aspect":
+      return photoAspectClass(p);
     default:
       return "";
   }
@@ -2150,8 +3738,116 @@ function isClusterKeeper(p) {
   return p == null || p.is_keeper == null || !!p.is_keeper;
 }
 
+/** Stack: one card per cluster (preferred/keeper only). */
 function browseKeepersOnlyView() {
-  return browseGalleryView === "thumbs";
+  return browseGalleryView === "thumbs" && !isDupesWorkspace();
+}
+
+function clusterRangeAffectsBrowse() {
+  return browseKeepersOnlyView() || browseGalleryView === "details";
+}
+
+/** Count live cluster members by group_id for badge display. */
+function clusterCountsByGroupId() {
+  const counts = new Map();
+  const pool = browseItemsFull.length ? browseItemsFull : browseItems;
+  for (const p of filterByPhotoVisibility(pool, { respectSelection: false })) {
+    if (p?.group_id == null) continue;
+    counts.set(p.group_id, (counts.get(p.group_id) || 0) + 1);
+  }
+  return counts;
+}
+
+/** Cluster partners for lightbox up/down — whole library, not just this tree selection. */
+async function clusterLightboxEntries(photo) {
+  if (photo?.group_id == null) return [];
+  if (isDupesWorkspace()) return [];
+  let members = [];
+  try {
+    members =
+      (await api(
+        `/api/browse/photos?group_by=cluster&key=${encodeURIComponent(photo.group_id)}&limit=200${removeQuery()}`
+      )) || [];
+  } catch (_) {
+    const pool = browseItemsFull.length ? browseItemsFull : browseItems;
+    members = filterByPhotoVisibility(
+      pool.filter((p) => p?.group_id === photo.group_id),
+      { respectSelection: false }
+    );
+  }
+  members = members.filter((p) => p?.id != null);
+  members.sort((a, b) => {
+    const ak = isClusterKeeper(a) ? 0 : 1;
+    const bk = isClusterKeeper(b) ? 0 : 1;
+    if (ak !== bk) return ak - bk;
+    return (Number(a.id) || 0) - (Number(b.id) || 0);
+  });
+  return members.map((p) => {
+    const m = browseMediaUrls(p);
+    return { src: m.original, orientation: orientationDeg(p), mirrored: isMirrored(p), photo: p };
+  });
+}
+
+/**
+ * Thumbs hide same-group replicas; acting on only the visible id leaves a sibling
+ * that pops back into the gallery. Expand to matching members in the current load
+ * (Expanded layout selects members explicitly — skip there).
+ * @param {"live"|"culled"|"all"} mode live = Reject; culled = Delete from Rejected; all = edits
+ */
+function expandReplicaIdsInGallery(ids, mode = "live") {
+  if (!browseKeepersOnlyView() || isDupesWorkspace() || !ids?.length) return ids;
+  const idSet = new Set(ids);
+  const groups = new Set();
+  const pool = browseItemsFull.length ? browseItemsFull : browseItems;
+  for (const p of pool) {
+    // Expand from visible cluster cards (keeper, or replica stand-in).
+    if (p?.id != null && idSet.has(p.id) && p.group_id != null) {
+      groups.add(p.group_id);
+    }
+  }
+  if (!groups.size) return ids;
+  for (const p of pool) {
+    if (p?.id == null || p.group_id == null) continue;
+    if (!groups.has(p.group_id)) continue;
+    if (mode === "live" && p.culled) continue;
+    if (mode === "culled" && !p.culled) continue;
+    idSet.add(p.id);
+  }
+  return [...idSet];
+}
+
+function expandRemoveIdsForHiddenReplicas(ids) {
+  return expandReplicaIdsInGallery(ids, "live");
+}
+
+function expandDeleteIdsForHiddenReplicas(ids) {
+  return expandReplicaIdsInGallery(ids, "culled");
+}
+
+function expandEditIdsForHiddenReplicas(ids) {
+  return expandReplicaIdsInGallery(ids, "all");
+}
+
+/** Visible Clustered cards plus hidden same-group members (for date/place edits). */
+function selectedBrowsePhotosForEdit() {
+  const selected = selectedBrowsePhotos().filter((p) => p.id != null);
+  if (!browseKeepersOnlyView() || isDupesWorkspace()) return selected;
+  const idSet = new Set(expandEditIdsForHiddenReplicas(selected.map((p) => p.id)));
+  const pool = browseItemsFull.length ? browseItemsFull : browseItems;
+  return pool.filter((p) => p?.id != null && idSet.has(p.id));
+}
+
+function selectedPhotosForProperties() {
+  if (isDupesWorkspace()) return selectedDupePhotos().filter((p) => p.id != null);
+  return selectedBrowsePhotosForEdit();
+}
+
+function dropLocalPhotosById(ids) {
+  const gone = new Set(ids);
+  if (!gone.size) return;
+  browseItems = browseItems.filter((p) => !gone.has(p.id));
+  browseItemsFull = browseItemsFull.filter((p) => !gone.has(p.id));
+  for (const id of gone) dupePhotosById?.delete?.(id);
 }
 
 function multiPersonSelection() {
@@ -2181,7 +3877,9 @@ function sortedBrowseItems() {
 function browseDisplayItems() {
   // Keep visual/hybrid rank order while a describe search is active.
   const raw = browseSearchActive ? [...browseItems] : sortedBrowseItems();
-  const items = filterByPhotoVisibility(raw, { respectSelection: true });
+  const items = filterByAspect(
+    filterByPhotoVisibility(raw, { respectSelection: true })
+  );
   if (!browseKeepersOnlyView()) return items;
   // Thumbs hide cluster replicas, but if a place/date filter only hits replicas
   // (keeper is elsewhere), still show one photo per group so the node isn't empty.
@@ -2201,6 +3899,7 @@ function browseDisplayItems() {
 }
 
 function browseVisibleKeys() {
+  if (browseGalleryView === "details") return browseVisibleDetailKeys();
   return browseDisplayItems().map(browseItemKey);
 }
 
@@ -2218,10 +3917,7 @@ function updateBrowseSelectionCount() {
   const countEl = $("#browse-gallery-count");
   if (countEl) {
     const total = browseDisplayItems().length;
-    const parts = [];
-    if (n) parts.push(`${n} selected`);
-    if (total) parts.push(`${total} photo${total === 1 ? "" : "s"}`);
-    countEl.textContent = parts.join(" · ");
+    countEl.textContent = total ? `${n} / ${total}` : "";
   }
   const btn = $("#btn-browse-select-all");
   if (!btn) return;
@@ -2263,7 +3959,7 @@ function peopleSelectionEditContext() {
   );
   const labeled = treeInput?.dataset.labeled === "1";
   const displayName =
-    (treeInput?.dataset.displayName || treeInput?.defaultValue || "").trim() ||
+    (treeInput?.dataset.displayName || treeInput?.value || treeInput?.textContent || "").trim() ||
     `Person ${personId}`;
   return {
     personId,
@@ -2286,29 +3982,31 @@ function syncBrowseRemoveButtons() {
   const removedIds = selected.filter((p) => p.id != null && p.culled).map((p) => p.id);
   const indexedIds = selected.filter((p) => p.id != null).map((p) => p.id);
   const removeBtn = $("#btn-browse-remove");
-  const restoreBtn = $("#btn-browse-restore");
   const deleteBtn = $("#btn-browse-delete");
   const editBtn = $("#btn-browse-edit");
+  const exportBtn = $("#btn-browse-export");
   const similarBtn = $("#btn-browse-similar");
   const addFolderBtn = $("#btn-browse-add-folder");
   const removeFolderBtn = $("#btn-browse-remove-folder");
   const actions = $(".browse-selection-actions");
   if (actions) actions.hidden = selected.length === 0;
   if (removeBtn) {
-    removeBtn.disabled = activeIds.length === 0;
-    removeBtn.textContent = "Remove selected";
-  }
-  if (restoreBtn) {
-    restoreBtn.disabled = removedIds.length === 0;
-    restoreBtn.textContent = "Restore selected";
+    const restoreMode = removedIds.length > 0;
+    removeBtn.disabled = restoreMode ? false : activeIds.length === 0;
+    removeBtn.textContent = restoreMode ? "Restore selected" : "Reject selected";
+    removeBtn.classList.toggle("danger", !restoreMode);
+    removeBtn.dataset.mode = restoreMode ? "restore" : "remove";
   }
   if (deleteBtn) {
-    deleteBtn.disabled = removedIds.length === 0;
-    deleteBtn.textContent = "Delete selected";
+    deleteBtn.disabled = removedIds.length === 0 || activeIds.length > 0;
   }
   if (editBtn) {
     editBtn.disabled = indexedIds.length === 0;
     editBtn.textContent = "Edit selection";
+  }
+  if (exportBtn) {
+    exportBtn.disabled = indexedIds.length === 0;
+    exportBtn.textContent = "Export selected";
   }
   if (similarBtn) {
     similarBtn.disabled = !(
@@ -2319,9 +4017,9 @@ function syncBrowseRemoveButtons() {
     addFolderBtn.disabled = indexedIds.length === 0;
   }
   if (removeFolderBtn) {
-    const inVfolder = activeVirtualFolderId() != null;
-    removeFolderBtn.hidden = !inVfolder;
-    removeFolderBtn.disabled = !inVfolder || indexedIds.length === 0;
+    const inCollection = activeCollectionId() != null && !activeCollectionFlags().linked;
+    removeFolderBtn.hidden = !inCollection;
+    removeFolderBtn.disabled = !inCollection || indexedIds.length === 0;
   }
 }
 
@@ -2331,7 +4029,11 @@ function toggleBrowseSelectAll() {
     if (!root) return;
     if (dupeSelected.size > 0) unselectDupeAll(root);
     else if (photoVisibility === "removed") selectDupeRemoved(root);
-    else selectDupeNonPrimary(root);
+    else {
+      selectDupeNonPrimary(root);
+      const unmatched = root.querySelector('.dupe-group[data-group="unmatched"]');
+      if (unmatched) selectDupeAll(unmatched);
+    }
     syncDupeToolbar();
     return;
   }
@@ -2408,6 +4110,7 @@ function clearLightboxFaces() {
   layer.style.top = "";
   layer.style.width = "";
   layer.style.height = "";
+  applyLightboxZoomPan();
 }
 
 function clearLightboxInfo() {
@@ -2420,6 +4123,7 @@ function clearLightboxInfo() {
   const edit = $("#lightbox-edit");
   const err = $("#lightbox-edit-error");
   const vqa = $("#lightbox-vqa");
+  const removedBadge = $("#lightbox-removed-badge");
   if (meta) meta.innerHTML = "";
   if (list) {
     list.innerHTML = "";
@@ -2431,6 +4135,7 @@ function clearLightboxInfo() {
     err.hidden = true;
     err.textContent = "";
   }
+  if (removedBadge) removedBadge.hidden = true;
   resetLightboxVqa();
   if (vqa) vqa.hidden = true;
   if (info) info.hidden = true;
@@ -2441,7 +4146,6 @@ function clearLightboxInfo() {
 function resetLightboxVqa() {
   const err = $("#lightbox-vqa-error");
   const answer = $("#lightbox-vqa-answer");
-  const askBtn = $("#lightbox-vqa-ask");
   if (err) {
     err.hidden = true;
     err.textContent = "";
@@ -2450,7 +4154,6 @@ function resetLightboxVqa() {
     answer.hidden = true;
     answer.textContent = "";
   }
-  if (askBtn) askBtn.disabled = false;
 }
 
 function setLightboxVqaTask(task) {
@@ -2464,9 +4167,7 @@ function setLightboxVqaTask(task) {
     btn.setAttribute("aria-pressed", on ? "true" : "false");
   });
   const freeWrap = $("#lightbox-vqa-freeform-wrap");
-  const askBtn = $("#lightbox-vqa-ask");
   if (freeWrap) freeWrap.hidden = next !== "freeform";
-  if (askBtn) askBtn.hidden = next !== "freeform";
 }
 
 function cancelPlaceSuggestion() {
@@ -2530,7 +4231,6 @@ async function runLightboxVqa(taskOverride = null) {
   const prompt = ($("#lightbox-vqa-prompt")?.value || "").trim();
   const err = $("#lightbox-vqa-error");
   const answer = $("#lightbox-vqa-answer");
-  const askBtn = $("#lightbox-vqa-ask");
   if (err) {
     err.hidden = true;
     err.textContent = "";
@@ -2554,7 +4254,6 @@ async function runLightboxVqa(taskOverride = null) {
     }
     return;
   }
-  if (askBtn) askBtn.disabled = true;
   document.querySelectorAll(".lightbox-vqa-preset").forEach((btn) => {
     btn.disabled = true;
   });
@@ -2597,7 +4296,6 @@ async function runLightboxVqa(taskOverride = null) {
       err.hidden = false;
     }
   } finally {
-    if (askBtn) askBtn.disabled = false;
     document.querySelectorAll(".lightbox-vqa-preset").forEach((btn) => {
       btn.disabled = !vqaConfigured;
     });
@@ -2639,8 +4337,7 @@ async function flushLightboxRecluster() {
       method: "POST",
       body: JSON.stringify({ person_ids: ids }),
     });
-    const peopleRoot = peopleBranchContainer();
-    if (peopleRoot?.dataset.loaded === "1") await fillPeopleBranch(peopleRoot);
+    await refreshPeopleBranchIfLoaded();
   } catch (err) {
     console.error("recluster failed", err);
   }
@@ -2752,10 +4449,7 @@ function bindLightboxFaceDismiss(btn) {
       renderLightboxFaceList(lightboxFaces);
       drawLightboxFaceBoxes();
       syncLightboxFramesOpt();
-      const peopleRoot = $("#browse-groups")?.querySelector('.browse-branch[data-branch="people"]');
-      if (peopleRoot?.dataset.loaded === "1") {
-        fillPeopleBranch(peopleRoot).catch(() => {});
-      }
+      refreshPeopleBranchIfLoaded().catch(() => {});
       // Drop dismissed face from gallery overlays for this photo.
       const photo = lightboxCurrentPhoto();
       if (photo?.faces) {
@@ -2888,6 +4582,7 @@ function drawLightboxFaceBoxes() {
       return `<span class="face-box${unlabeled ? " is-unlabeled" : ""}" style="left:${f.bbox_x * 100}%;top:${f.bbox_y * 100}%;width:${f.bbox_w * 100}%;height:${f.bbox_h * 100}%;${faceBoxStyle(f)}">${labelHtml}</span>`;
     })
     .join("");
+  applyLightboxZoomPan();
 }
 
 function syncLightboxFramesOpt() {
@@ -2929,24 +4624,29 @@ async function loadLightboxFaces(photo) {
 function lightboxMetaRows(p) {
   if (!p) return [];
   const rows = [];
-  const name = basename(p.path || p.rel_path);
-  if (name) rows.push(["Name", name]);
   const archive = photoArchiveName(p);
-  if (archive) rows.push(["Archive", archive]);
+  if (archive) rows.push(["Volume", archive]);
   const path = photoPath(p);
   if (path) rows.push(["Path", path]);
-  rows.push(["Date", p.taken_at ? p.taken_at.slice(0, 19) : "undated"]);
-  if (p.place_label) rows.push(["Place", p.place_label]);
   if (p.camera) rows.push(["Camera", p.camera]);
-  if (formatDims(p) !== "—") rows.push(["Dimensions", formatDims(p)]);
-  if (formatBytes(p.size) !== "—") rows.push(["Size", formatBytes(p.size)]);
-  const orient = orientationDeg(p);
-  if (orient) rows.push(["Orientation", `${orient}°`]);
-  if (isMirrored(p)) rows.push(["Mirror", "yes"]);
-  if (p.lat != null && p.lon != null) {
-    const coords = `${Number(p.lat).toFixed(5)}, ${Number(p.lon).toFixed(5)}`;
-    rows.push(["Coordinates", p.gps ? `${coords} (GPS)` : coords]);
+  const dims = formatDims(p);
+  const bytes = formatBytes(p.size);
+  if (dims !== "—" || bytes !== "—") {
+    const sizeVal =
+      dims !== "—" && bytes !== "—" ? `${dims} (${bytes})` : dims !== "—" ? dims : bytes;
+    rows.push(["Size", sizeVal]);
   }
+  const hasCoords = p.lat != null && p.lon != null;
+  const coords = hasCoords
+    ? `${Number(p.lat).toFixed(5)}, ${Number(p.lon).toFixed(5)}`
+    : "—";
+  const src = coordSourceLabel(p.coord_source) || (p.gps ? "EXIF" : "");
+  const text = hasCoords && src ? `${coords} (${src})` : coords;
+  const refreshBtn = `<button type="button" class="lightbox-coords-refresh" title="Read from EXIF" aria-label="Read coordinates from EXIF"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M17.65 6.35A7.95 7.95 0 0 0 12 4V1L7 6l5 5V7c2.76 0 5 2.24 5 5a5 5 0 0 1-5 5 5 5 0 0 1-4.9-4H5.08A7 7 0 0 0 12 19a7 7 0 0 0 7-7c0-1.93-.78-3.68-2.05-4.95z"/></svg></button>`;
+  const mapBtn = hasCoords
+    ? `<button type="button" class="lightbox-coords-map" title="Show on map" aria-label="Show on map"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5S10.62 6.5 12 6.5s2.5 1.12 2.5 2.5S13.38 11.5 12 11.5z"/></svg></button>`
+    : "";
+  rows.push(["Coordinates", text, refreshBtn + mapBtn, lightboxCoordsDiffer(p)]);
   if (p.score != null) rows.push(["Score", Number(p.score).toFixed(3)]);
   if (p.distance_km != null) rows.push(["Distance", `${p.distance_km} km`]);
   return rows;
@@ -2963,33 +4663,233 @@ function renderLightboxMeta(p) {
   }
   info.hidden = false;
   meta.innerHTML = rows
-    .map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(v)}</dd>`)
+    .map(
+      ([k, v, extra, differs]) =>
+        `<dt>${escapeHtml(k)}</dt><dd><span${differs ? ' class="is-diff"' : ""}>${escapeHtml(v)}</span>${extra ? " " + extra : ""}</dd>`
+    )
     .join("");
 }
 
 let lightboxGroup = [];
 let lightboxIndex = -1;
+/** Same-group stack for up/down nav (Default gallery clusters). */
+let lightboxCluster = [];
+let lightboxClusterIndex = -1;
 
 function lightboxCurrentPhoto() {
+  if (lightboxClusterIndex >= 0 && lightboxClusterIndex < lightboxCluster.length) {
+    return lightboxCluster[lightboxClusterIndex]?.photo || null;
+  }
   if (lightboxIndex >= 0 && lightboxIndex < lightboxGroup.length) {
     return lightboxGroup[lightboxIndex]?.photo || null;
   }
   return null;
 }
 
+function lightboxCurrentEntry() {
+  if (lightboxClusterIndex >= 0 && lightboxClusterIndex < lightboxCluster.length) {
+    return lightboxCluster[lightboxClusterIndex] || null;
+  }
+  if (lightboxIndex >= 0 && lightboxIndex < lightboxGroup.length) {
+    return lightboxGroup[lightboxIndex] || null;
+  }
+  return null;
+}
+
+async function setLightboxClusterFromPhoto(photo) {
+  lightboxCluster = await clusterLightboxEntries(photo);
+  if (!lightboxCluster.length) {
+    lightboxClusterIndex = -1;
+    return;
+  }
+  const id = photo?.id;
+  const idx = lightboxCluster.findIndex((e) => e.photo?.id === id);
+  lightboxClusterIndex = idx >= 0 ? idx : 0;
+}
+
+function syncLightboxShowMapBtn(_photo) {}
+
+function coordSourceLabel(src) {
+  if (src === "exif") return "EXIF";
+  if (src === "manual") return "manual";
+  if (src === "geocode") return "place";
+  return "";
+}
+
+function lightboxCoordsDiffer(p) {
+  if (!p || p.lat == null || p.lon == null) return false;
+  const meta = lightboxFileMeta;
+  if (meta && !meta.error && meta.photo_id === p.id) return !meta.gps_matches_exif;
+  return p.coord_source === "geocode";
+}
+
+function dateFileMetaDiffers(meta) {
+  return !!(meta?.taken_at && !meta.date_matches_exif);
+}
+
+function gpsFileMetaDiffers(meta) {
+  return !!(meta && meta.lat != null && meta.lon != null && !meta.gps_matches_exif);
+}
+
+function fileMetaCanWrite(meta) {
+  return !!(meta?.can_write_exif && (dateFileMetaDiffers(meta) || gpsFileMetaDiffers(meta)));
+}
+
+let lightboxFileMeta = null;
+let lightboxFileMetaGen = 0;
+
+function renderLightboxFileMeta(meta) {
+  lightboxFileMeta = meta || null;
+  const takenEl = $("#lightbox-taken-at");
+  if (takenEl) {
+    takenEl.classList.toggle("is-diff", dateFileMetaDiffers(meta));
+    takenEl.removeAttribute("title");
+  }
+  const btn = $("#lightbox-write-exif");
+  if (btn) {
+    const can = fileMetaCanWrite(meta);
+    btn.hidden = !can;
+    btn.disabled = !can;
+  }
+  const photo = lightboxCurrentPhoto();
+  if (photo) renderLightboxMeta(photo);
+}
+
+async function refreshLightboxFileMeta(photo) {
+  const gen = ++lightboxFileMetaGen;
+  renderLightboxFileMeta(null);
+  if (photo?.id == null) return;
+  try {
+    const res = await api("/api/photos/file-meta", {
+      method: "POST",
+      body: JSON.stringify({ photo_ids: [photo.id] }),
+    });
+    if (gen !== lightboxFileMetaGen) return;
+    renderLightboxFileMeta(res.photos?.[0] || null);
+  } catch {
+    if (gen !== lightboxFileMetaGen) return;
+    renderLightboxFileMeta(null);
+  }
+}
+
+async function writeLightboxExif() {
+  const photo = lightboxCurrentPhoto();
+  const btn = $("#lightbox-write-exif");
+  const err = $("#lightbox-edit-error");
+  if (photo?.id == null) return;
+  if (lightboxSaveInFlight) {
+    const saved = await lightboxSaveInFlight;
+    if (!saved) return;
+  } else if (lightboxEditsDirty(photo)) {
+    const saved = await saveLightboxEdits({ showErrors: true });
+    if (!saved) return;
+  }
+  await refreshLightboxFileMeta(photo);
+  const dateDiff = dateFileMetaDiffers(lightboxFileMeta);
+  const gpsDiff = gpsFileMetaDiffers(lightboxFileMeta);
+  if (!dateDiff && !gpsDiff) return;
+  const msg =
+    dateDiff && gpsDiff
+      ? "Write date and coordinates to EXIF?"
+      : dateDiff
+        ? "Write date to EXIF?"
+        : "Write coordinates to EXIF?";
+  if (!confirm(msg)) return;
+  if (btn) btn.disabled = true;
+  if (err) {
+    err.hidden = true;
+    err.textContent = "";
+  }
+  try {
+    const res = await api("/api/photos/write-exif", {
+      method: "POST",
+      body: JSON.stringify({
+        photo_ids: [photo.id],
+        taken_at: dateDiff,
+        gps: gpsDiff,
+      }),
+    });
+    if (res.errors?.length && !res.updated) {
+      throw new Error(res.errors[0].error || "Write failed");
+    }
+    if (gpsDiff && photo.lat != null && photo.lon != null) {
+      photoMapLoaded = false;
+      photoMapBounds = null;
+      patchLocalCoordsById(photo.id, Number(photo.lat), Number(photo.lon), "exif");
+    } else {
+      await refreshLightboxFileMeta(photo);
+    }
+  } catch (ex) {
+    if (err) {
+      err.textContent = ex.message || "Write failed";
+      err.hidden = false;
+    }
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function reloadLightboxExifCoords() {
+  const photo = lightboxCurrentPhoto();
+  const err = $("#lightbox-edit-error");
+  if (photo?.id == null) return;
+  if (err) {
+    err.hidden = true;
+    err.textContent = "";
+  }
+  const btn = $(".lightbox-meta")?.querySelector(".lightbox-coords-refresh");
+  if (btn) btn.disabled = true;
+  try {
+    const res = await api("/api/photos/reload-exif-gps", {
+      method: "POST",
+      body: JSON.stringify({ photo_ids: [photo.id] }),
+    });
+    if (res.errors?.length && !res.updated) {
+      throw new Error(res.errors[0].error || "Could not read EXIF");
+    }
+    const next = res.photos?.[0];
+    photoMapLoaded = false;
+    photoMapBounds = null;
+    patchLocalCoordsById(
+      photo.id,
+      next?.lat ?? null,
+      next?.lon ?? null,
+      next?.coord_source || null,
+      next || { place_label: null }
+    );
+  } catch (ex) {
+    if (err) {
+      err.textContent = ex.message || "Could not read EXIF";
+      err.hidden = false;
+    }
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+function setLightboxOrientationControl(deg) {
+  const d = orientationDeg(deg);
+  const input = $("#lightbox-orientation");
+  if (input) input.value = String(d);
+}
+
 function syncLightboxEditControls(photo, orientation, mirrored) {
   const edit = $("#lightbox-edit");
   const placeEl = $("#lightbox-place");
   const takenEl = $("#lightbox-taken-at");
-  const orientEl = $("#lightbox-orientation");
   const mirrorEl = $("#lightbox-mirror");
   const similarBtn = $("#lightbox-similar");
   const removeBtn = $("#lightbox-remove");
   const restoreBtn = $("#lightbox-restore");
+  const deleteBtn = $("#lightbox-delete");
+  const removedBadge = $("#lightbox-removed-badge");
   const err = $("#lightbox-edit-error");
   const canEdit = photo?.id != null;
   if (edit) edit.hidden = !canEdit;
-  if (!canEdit) return;
+  if (!canEdit) {
+    if (removedBadge) removedBadge.hidden = true;
+    renderLightboxFileMeta(null);
+    return;
+  }
   if (err) {
     err.hidden = true;
     err.textContent = "";
@@ -2998,10 +4898,14 @@ function syncLightboxEditControls(photo, orientation, mirrored) {
   if (takenEl) takenEl.value = takenAtToInputValue(photo?.taken_at);
   const deg = orientationDeg(orientation ?? photo?.orientation);
   const mirror = mirrored ?? isMirrored(photo);
-  if (orientEl) orientEl.value = String(deg);
+  setLightboxOrientationControl(deg);
+  const rotateEl = $("#lightbox-rotate");
+  if (rotateEl) rotateEl.setAttribute("aria-pressed", deg ? "true" : "false");
   if (mirrorEl) setPressOn(mirrorEl, !!mirror);
   setLightboxTransform(deg, mirror);
   const culled = !!photo?.culled;
+  if (removedBadge) removedBadge.hidden = !culled;
+  syncLightboxShowMapBtn(photo);
   if (similarBtn) {
     similarBtn.disabled = photo?.content_id == null;
   }
@@ -3013,9 +4917,20 @@ function syncLightboxEditControls(photo, orientation, mirrored) {
     restoreBtn.hidden = !culled;
     restoreBtn.disabled = false;
   }
+  if (deleteBtn) {
+    deleteBtn.hidden = false;
+    deleteBtn.disabled = !culled;
+    deleteBtn.title = culled ? "Delete" : "Reject the photo first";
+  }
+  refreshLightboxFileMeta(photo);
 }
 
-function applyPlaceFieldsToPhoto(photo, place) {
+function coordsAreProtected(photo) {
+  const src = photo?.coord_source;
+  return src === "exif" || src === "manual";
+}
+
+function applyPlaceFieldsToPhoto(photo, place, { overwriteCoords = false } = {}) {
   if (!photo) return;
   if (!place) {
     photo.place_label = null;
@@ -3023,9 +4938,11 @@ function applyPlaceFieldsToPhoto(photo, place) {
     photo.city = null;
     photo.region = null;
     photo.country = null;
-    if (!photo.gps) {
+    if (!coordsAreProtected(photo)) {
       photo.lat = null;
       photo.lon = null;
+      photo.coord_source = null;
+      photo.gps = 0;
     }
     return;
   }
@@ -3034,19 +4951,25 @@ function applyPlaceFieldsToPhoto(photo, place) {
   photo.city = place.city || null;
   photo.region = place.region || null;
   photo.country = place.country || null;
-  if (place.lat != null && place.lon != null) {
+  const canApplyCoords = overwriteCoords || !coordsAreProtected(photo);
+  if (place.lat != null && place.lon != null && canApplyCoords) {
     photo.lat = place.lat;
     photo.lon = place.lon;
     photo.gps = 0;
-  } else if (!photo.gps) {
+    photo.coord_source = place.coord_source || "geocode";
+  } else if (!coordsAreProtected(photo) && (place.lat == null || place.lon == null)) {
     photo.lat = null;
     photo.lon = null;
+    photo.coord_source = null;
+    photo.gps = 0;
   }
 }
 
 function applyLightboxEditPreview() {
   const deg = orientationDeg($("#lightbox-orientation")?.value);
   const mirrored = isPressOn($("#lightbox-mirror"));
+  const rotateEl = $("#lightbox-rotate");
+  if (rotateEl) rotateEl.setAttribute("aria-pressed", deg ? "true" : "false");
   setLightboxTransform(deg, mirrored);
 }
 
@@ -3111,17 +5034,25 @@ async function saveLightboxEdits({ showErrors = false } = {}) {
       photo.mirrored = mirrored;
       if (takenEdited && takenValue) {
         photo.taken_at = takenValue.replace("T", " ");
+        photo.taken_at_source = "manual";
       }
       if (placeEdited) applyPlaceFieldsToPhoto(photo, res.place ?? null);
-      if (lightboxIndex >= 0 && lightboxIndex < lightboxGroup.length) {
-        const entry = lightboxGroup[lightboxIndex];
+      const syncEntry = (entry) => {
+        if (!entry || entry.photo?.id !== id) return;
         entry.orientation = orientation;
         entry.mirrored = mirrored;
         entry.photo = photo;
+      };
+      if (lightboxIndex >= 0 && lightboxIndex < lightboxGroup.length) {
+        syncEntry(lightboxGroup[lightboxIndex]);
+      }
+      if (lightboxClusterIndex >= 0 && lightboxClusterIndex < lightboxCluster.length) {
+        syncEntry(lightboxCluster[lightboxClusterIndex]);
       }
       if (placeEdited) {
         const placeEl = $("#lightbox-place");
         if (placeEl) placeEl.value = (photo.place_label || "").trim();
+        syncLightboxShowMapBtn(photo);
       }
       if (takenEdited) {
         const takenEl = $("#lightbox-taken-at");
@@ -3132,7 +5063,10 @@ async function saveLightboxEdits({ showErrors = false } = {}) {
         if (!local) return;
         local.orientation = orientation;
         local.mirrored = mirrored;
-        if (takenEdited && takenValue) local.taken_at = photo.taken_at;
+        if (takenEdited && takenValue) {
+          local.taken_at = photo.taken_at;
+          local.taken_at_source = "manual";
+        }
         if (placeEdited) applyPlaceFieldsToPhoto(local, res.place ?? null);
       };
       patchLocal(browseItems.find((p) => p.id === id));
@@ -3145,11 +5079,13 @@ async function saveLightboxEdits({ showErrors = false } = {}) {
         photoMapBounds = null;
         if (typeof refreshExpandedBranches === "function") {
           const branches = [];
-          if (placeEdited) branches.push("location");
-          if (takenEdited) branches.push("date");
+          if (placeEdited) branches.push("places");
+          if (takenEdited) branches.push("dates");
+          if (placeEdited || takenEdited) branches.push("collections");
           refreshExpandedBranches(branches).catch(() => {});
         }
       }
+      await refreshLightboxFileMeta(photo);
       return true;
     } catch (ex) {
       if (showErrors && err) {
@@ -3165,6 +5101,29 @@ async function saveLightboxEdits({ showErrors = false } = {}) {
   return lightboxSaveInFlight;
 }
 
+async function showLightboxPhotoOnMap() {
+  const photo = lightboxCurrentPhoto();
+  const lat = Number(photo?.lat);
+  const lon = Number(photo?.lon);
+  if (!photo?.id || !Number.isFinite(lat) || !Number.isFinite(lon)) return;
+  const saved = await saveLightboxEdits({ showErrors: true });
+  if (!saved) return;
+  $("#lightbox")?.close();
+  await activateWorkspaceView("map");
+  if (photoMapLoadInFlight) await photoMapLoadInFlight;
+  else if (!photoMapLoaded) await loadMap(true);
+  focusMapOnPhoto(photo.id, lat, lon);
+}
+
+function focusMapOnPhoto(photoId, lat, lon) {
+  if (!photoMap || !photoMapCluster) return;
+  const run = () => {
+    photoMap.invalidateSize();
+    photoMap.setView([lat, lon], Math.max(photoMap.getZoom(), 15));
+  };
+  requestAnimationFrame(() => setTimeout(run, 60));
+}
+
 function patchLocalPhotoCulled(id, culled) {
   const patch = (p) => {
     if (p && p.id === id) p.culled = culled;
@@ -3173,6 +5132,11 @@ function patchLocalPhotoCulled(id, culled) {
   browseItemsFull.forEach(patch);
   const dupe = dupePhotosById?.get?.(id);
   if (dupe) dupe.culled = culled;
+  // Active scope must not keep removed photos (else they reappear as Unmatched).
+  if (culled && photoVisibility === "active") {
+    browseItems = browseItems.filter((p) => p?.id !== id);
+    browseItemsFull = browseItemsFull.filter((p) => p?.id !== id);
+  }
 }
 
 async function removeLightboxPhoto() {
@@ -3183,15 +5147,21 @@ async function removeLightboxPhoto() {
   if (btn) btn.disabled = true;
   try {
     await saveLightboxEdits({ showErrors: true });
-    await removePhotoIds([id]);
+    const ids = expandRemoveIdsForHiddenReplicas([id]);
+    await removePhotoIds(ids);
     photo.culled = true;
-    patchLocalPhotoCulled(id, true);
+    ids.forEach((rid) => patchLocalPhotoCulled(rid, true));
     browseSelected.delete(browseItemKey(photo));
-    if (lightboxIndex >= 0 && lightboxIndex < lightboxGroup.length) {
+    if (
+      lightboxIndex >= 0 &&
+      lightboxIndex < lightboxGroup.length &&
+      lightboxGroup[lightboxIndex].photo?.id === id
+    ) {
       lightboxGroup[lightboxIndex].photo = photo;
     }
     if (photoVisibility === "active") {
-      lightboxGroup.splice(lightboxIndex, 1);
+      const gone = new Set(ids);
+      lightboxGroup = lightboxGroup.filter((entry) => !gone.has(entry.photo?.id));
       if (!lightboxGroup.length) {
         $("#lightbox")?.close();
         if (typeof renderBrowseResults === "function") renderBrowseResults();
@@ -3204,6 +5174,7 @@ async function removeLightboxPhoto() {
     } else {
       syncLightboxEditControls(photo, photo.orientation, isMirrored(photo));
       renderLightboxMeta(photo);
+      syncLightboxNav();
     }
     if (typeof renderBrowseResults === "function" && browseItems.length) {
       renderBrowseResults();
@@ -3212,7 +5183,7 @@ async function removeLightboxPhoto() {
   } catch (ex) {
     const err = $("#lightbox-edit-error");
     if (err) {
-      err.textContent = ex.message || "Remove failed";
+      err.textContent = ex.message || "Reject failed";
       err.hidden = false;
     }
   } finally {
@@ -3263,24 +5234,94 @@ async function restoreLightboxPhoto() {
   }
 }
 
-function syncLightboxLayoutMode() {
-  const dlg = $("#lightbox");
-  if (!dlg) return;
-  const img = $("#lightbox-img");
-  let w = img?.naturalWidth || 0;
-  let h = img?.naturalHeight || 0;
-  const deg = orientationDeg($("#lightbox-orientation")?.value);
-  if (deg === 90 || deg === 270) {
-    const t = w;
-    w = h;
-    h = t;
+async function deleteLightboxPhoto() {
+  const photo = lightboxCurrentPhoto();
+  const id = photo?.id;
+  if (id == null || !photo.culled) return;
+  if (
+    !confirm(
+      "Delete this file?\n\nThe file is moved to the system trash (not permanently erased). It will be removed from the index."
+    )
+  ) {
+    return;
   }
-  // Landscape photo: image on top, props|Ask side-by-side below.
-  // Portrait photo: image beside stacked props + Ask.
-  const landscape = w > 0 && h > 0 ? w >= h : true;
-  dlg.classList.toggle("is-landscape", landscape);
-  dlg.classList.toggle("is-portrait", !landscape);
+  const btn = $("#lightbox-delete");
+  const restoreBtn = $("#lightbox-restore");
+  if (btn) btn.disabled = true;
+  if (restoreBtn) restoreBtn.disabled = true;
+  try {
+    const ids = expandDeleteIdsForHiddenReplicas([id]);
+    const res = await deletePhotoIds(ids);
+    const deletedIds = res?.deleted_ids?.length ? res.deleted_ids : ids;
+    const failed = res?.failed || 0;
+    dropLocalPhotosById(deletedIds);
+    browseSelected.delete(browseItemKey(photo));
+    const gone = new Set(deletedIds);
+    lightboxGroup = lightboxGroup.filter((entry) => !gone.has(entry.photo?.id));
+    lightboxCluster = lightboxCluster.filter((entry) => !gone.has(entry.photo?.id));
+    if (failed) {
+      alert(
+        `Deleted from the index. ${failed} file${failed === 1 ? "" : "s"} could not be moved to trash (kept in Rejected).`
+      );
+    }
+    if (!lightboxGroup.length) {
+      $("#lightbox")?.close();
+    } else {
+      const next = Math.min(Math.max(lightboxIndex, 0), lightboxGroup.length - 1);
+      lightboxIndex = -1;
+      lightboxCluster = [];
+      lightboxClusterIndex = -1;
+      await lightboxNavigateTo(next);
+    }
+    if (typeof renderBrowseResults === "function") renderBrowseResults();
+    if (isDupesWorkspace() && typeof loadDupes === "function") {
+      await loadDupes();
+    }
+    refreshScopedWorkspaceViews();
+    refreshStats();
+  } catch (ex) {
+    const err = $("#lightbox-edit-error");
+    if (err) {
+      err.textContent = ex.message || "Delete failed";
+      err.hidden = false;
+    }
+  } finally {
+    if (btn) btn.disabled = false;
+    if (restoreBtn) restoreBtn.disabled = false;
+  }
+}
+
+function syncLightboxLayoutMode() {
   requestAnimationFrame(() => drawLightboxFaceBoxes());
+}
+
+const LIGHTBOX_FULLSCREEN_KEY = "fotoman.lightboxFullscreen";
+
+function lightboxFullscreenPref() {
+  try {
+    return localStorage.getItem(LIGHTBOX_FULLSCREEN_KEY) === "1";
+  } catch (_) {
+    return false;
+  }
+}
+
+function setLightboxFullscreen(on, { persist = true } = {}) {
+  const dlg = $("#lightbox");
+  const btn = $("#lightbox-fullscreen");
+  dlg?.classList.toggle("is-fullscreen", on);
+  if (btn) {
+    btn.setAttribute("aria-pressed", on ? "true" : "false");
+    btn.title = on ? "Exit full screen" : "Full screen";
+  }
+  if (persist) {
+    try {
+      localStorage.setItem(LIGHTBOX_FULLSCREEN_KEY, on ? "1" : "0");
+    } catch (_) {
+      /* ignore */
+    }
+  }
+  syncLightboxLayoutMode();
+  requestAnimationFrame(() => applyLightboxZoomPan());
 }
 
 async function lightboxNavigateTo(idx) {
@@ -3290,8 +5331,28 @@ async function lightboxNavigateTo(idx) {
   if (!saved) return;
   lightboxIndex = idx;
   const entry = lightboxGroup[idx];
+  lightboxCluster = [];
+  lightboxClusterIndex = -1;
+  await showLightboxEntry(entry);
+  await setLightboxClusterFromPhoto(entry.photo || null);
+  syncLightboxNav();
+}
+
+async function lightboxNavigateCluster(delta) {
+  if (lightboxCluster.length < 2) return;
+  const idx = lightboxClusterIndex + delta;
+  if (idx < 0 || idx >= lightboxCluster.length) return;
+  const saved = await saveLightboxEdits({ showErrors: true });
+  if (!saved) return;
+  lightboxClusterIndex = idx;
+  await showLightboxEntry(lightboxCluster[idx]);
+}
+
+async function showLightboxEntry(entry) {
+  if (!entry) return;
   const photo = entry.photo || null;
   const src = entry.src || "";
+  resetLightboxZoomPan();
   clearLightboxFaces();
   clearLightboxInfo();
   lightboxFallbackFace = entry.face || null;
@@ -3318,8 +5379,20 @@ async function lightboxNavigateTo(idx) {
 function syncLightboxNav() {
   const prev = $("#lightbox-prev");
   const next = $("#lightbox-next");
-  if (prev) prev.hidden = lightboxGroup.length < 2 || lightboxIndex <= 0;
-  if (next) next.hidden = lightboxGroup.length < 2 || lightboxIndex >= lightboxGroup.length - 1;
+  const up = $("#lightbox-up");
+  const down = $("#lightbox-down");
+  const pos = $("#lightbox-cluster-pos");
+  const hasGroup = lightboxGroup.length >= 2;
+  if (prev) prev.disabled = !hasGroup || lightboxIndex <= 0;
+  if (next) next.disabled = !hasGroup || lightboxIndex >= lightboxGroup.length - 1;
+  const clusterNav = lightboxCluster.length >= 2;
+  if (up) up.disabled = !clusterNav || lightboxClusterIndex <= 0;
+  if (down) down.disabled = !clusterNav || lightboxClusterIndex >= lightboxCluster.length - 1;
+  if (pos) {
+    pos.textContent = clusterNav
+      ? `${lightboxClusterIndex + 1}/${lightboxCluster.length}`
+      : "";
+  }
 }
 
 function openLightbox({ src, face = null, orientation = 0, mirrored = null, photo = null, group = [], groupIndex = -1 } = {}) {
@@ -3335,29 +5408,19 @@ function openLightbox({ src, face = null, orientation = 0, mirrored = null, phot
   }
   lightboxGroup = group;
   lightboxIndex = groupIndex;
-  const img = $("#lightbox-img");
-  clearLightboxFaces();
-  clearLightboxInfo();
-  lightboxFallbackFace = face;
-  const orient = orientation ?? photo?.orientation;
-  const mirror = mirrored != null ? !!mirrored : isMirrored(photo);
-  syncLightboxEditControls(photo, orient, mirror);
-  renderLightboxMeta(photo);
-  if (photo) $("#lightbox-info").hidden = false;
-  syncLightboxFramesOpt();
-  img.onload = null;
-  img.src = src || "";
-  const afterLoad = () => {
-    syncLightboxLayoutMode();
-    drawLightboxFaceBoxes();
+  lightboxCluster = [];
+  lightboxClusterIndex = -1;
+  const entry = {
+    src: src || (photo?.id != null ? `/api/original/${photo.id}` : ""),
+    face,
+    orientation: orientation ?? photo?.orientation,
+    mirrored: mirrored != null ? !!mirrored : isMirrored(photo),
+    photo,
   };
-  if (img.complete && img.naturalWidth) afterLoad();
-  else img.onload = afterLoad;
-  loadLightboxFaces(photo);
-  syncLightboxVqa(photo);
-  syncLightboxNav();
+  void showLightboxEntry(entry);
   $("#lightbox").showModal();
   syncLightboxLayoutMode();
+  void setLightboxClusterFromPhoto(photo).then(() => syncLightboxNav());
 }
 
 function openBrowseLightbox(original, face, orientation, photo, group = [], groupIndex = -1, mirrored = false) {
@@ -3391,7 +5454,7 @@ function syncBrowseSelectionDom(root = $("#browse-results")) {
 }
 
 function applyBrowseItemSelection(key, e) {
-  const keys = sortedBrowseItems().map(browseItemKey);
+  const keys = browseVisibleKeys();
   const idx = keys.indexOf(key);
   if (idx < 0) return;
   const range = e.shiftKey;
@@ -3411,9 +5474,559 @@ function applyBrowseItemSelection(key, e) {
   browseAnchorKey = key;
 }
 
+let photoTreeDrag = null;
+let galleryDragSuppressClick = false;
+
+function photosForCardDrag(startKey) {
+  const keys =
+    browseSelected.has(startKey) && browseSelected.size
+      ? [...browseSelected]
+      : [startKey];
+  const byKey = new Map(browseItems.map((p) => [browseItemKey(p), p]));
+  return keys.map((k) => byKey.get(k)).filter((p) => p && p.id != null);
+}
+
+function photosForPropertyDrop(photos) {
+  const indexed = (photos || []).filter((p) => p.id != null);
+  if (!browseKeepersOnlyView()) return indexed;
+  const idSet = new Set(expandEditIdsForHiddenReplicas(indexed.map((p) => p.id)));
+  const pool = browseItemsFull.length ? browseItemsFull : browseItems;
+  return pool.filter((p) => p?.id != null && idSet.has(p.id));
+}
+
+/** Face ids for the currently selected tree person only (not every bbox on the photo). */
+function selectedPersonFaceIds(photos) {
+  const personIds = selectedTreePersonIds();
+  if (personIds.length !== 1) return [];
+  const pid = personIds[0];
+  const ids = [];
+  for (const p of photos || []) {
+    const faces = browseFaceBoxes(p);
+    const match = faces.find((f) => Number(f.person_id) === pid);
+    let fid = Number(match?.id);
+    if (!(fid > 0) && Number(p.person_id) === pid) fid = Number(p.face_id);
+    if (fid > 0) ids.push(fid);
+  }
+  return [...new Set(ids)];
+}
+
+function takenAtFromDatePath(path) {
+  const raw = String(path || "");
+  if (/^\d{4}$/.test(raw)) return `${raw}-01-01T00:00:00`;
+  if (/^\d{4}-\d{2}$/.test(raw)) return `${raw}-01T00:00:00`;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return `${raw}T00:00:00`;
+  return null;
+}
+
+function placeLabelFromLocationPath(path, kind) {
+  const raw = String(path || "");
+  if (raw.startsWith("place-suffix::")) return raw.slice("place-suffix::".length);
+  if (kind === "place" && raw.startsWith("place::")) return raw.slice("place::".length);
+  if (kind === "country" && raw.startsWith("country::")) return raw.slice("country::".length);
+  if (kind === "city" && raw.startsWith("city::")) {
+    const rest = raw.slice("city::".length);
+    const i = rest.indexOf("::");
+    if (i < 0) return rest;
+    return `${rest.slice(i + 2)}, ${rest.slice(0, i)}`;
+  }
+  if (kind === "venue" && raw.startsWith("venue::")) {
+    const parts = raw.slice("venue::".length).split("::");
+    if (parts.length >= 3) return `${parts.slice(2).join("::")}, ${parts[1]}, ${parts[0]}`;
+  }
+  return null;
+}
+
+function placeParentSuffix(label) {
+  const s = String(label || "").trim();
+  const i = s.indexOf(", ");
+  return i >= 0 ? s.slice(i + 2) : "";
+}
+
+function placeLabelMatchesSource(label, sourceLabel) {
+  const photo = String(label || "").trim();
+  const source = String(sourceLabel || "").trim();
+  if (!photo || !source) return false;
+  return photo === source || photo.endsWith(`, ${source}`);
+}
+
+/** Folder-move Place rewrite: keep [*, source-node], replace source parent with target. */
+function relocatePlaceLabel(photoLabel, sourceLabel, targetLabel) {
+  const photo = String(photoLabel || "").trim();
+  const source = String(sourceLabel || "").trim();
+  const target = String(targetLabel || "").trim();
+  if (!target || !placeLabelMatchesSource(photo, source)) return photo;
+  const parent = placeParentSuffix(source);
+  if (!parent) return `${photo}, ${target}`;
+  const suffix = `, ${parent}`;
+  if (photo === parent) return target;
+  if (photo.endsWith(suffix)) return `${photo.slice(0, -suffix.length)}, ${target}`;
+  return photo;
+}
+
+function isPlaceMoveIntoSelf(sourceLabel, targetLabel) {
+  return placeLabelMatchesSource(targetLabel, sourceLabel);
+}
+
+function treeDropActionAtEvent(e) {
+  return treeDropActionFromEl(
+    document.elementFromPoint(e.clientX, e.clientY) || e.target
+  );
+}
+
+function isDraggableTreeBranch(item) {
+  if (!item || item.classList.contains("browse-branch")) return false;
+  const gb = item.dataset.groupBy;
+  const path = item.dataset.path;
+  if (!path) return false;
+  if (gb === "date") return !!takenAtFromDatePath(path);
+  if (gb === "location") return !!placeLabelFromLocationPath(path, item.dataset.kind || "");
+  if (gb === "folder" || gb === "collection" || gb === "camera") return true;
+  if (gb === "person" && item.classList.contains("browse-person")) {
+    return Number(path) > 0;
+  }
+  return false;
+}
+
+function treeItemLabel(item) {
+  if (!item) return "";
+  const person = item.querySelector(".person-label");
+  if (person) {
+    return (person.dataset.displayName || person.value || person.textContent || "").trim();
+  }
+  const editing = item.querySelector(".tree-label-edit");
+  if (editing) return (editing.value || "").trim();
+  return (item.querySelector(".browse-item-name")?.textContent || "").trim();
+}
+
+function treeItemCount(item) {
+  const raw = (item?.querySelector(".browse-item-count")?.textContent || "").trim();
+  if (!raw) return 0;
+  const parts = raw.split("/").map((s) => parseInt(s, 10)).filter(Number.isFinite);
+  return parts.length ? parts[parts.length - 1] : 0;
+}
+
+function friendlyTakenAt(action) {
+  const path = String(action.path || "");
+  const m = String(action.taken_at || "").match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (!m) return action.taken_at || "";
+  const monthName = MONTH_LABELS[Number(m[2])] || m[2];
+  const day = Number(m[3]);
+  if (/^\d{4}$/.test(path) || /^\d{4}-\d{2}$/.test(path)) return `1 ${monthName} ${m[1]}`;
+  return `${day} ${monthName} ${m[1]}`;
+}
+
+function branchDropConfirmMessage(action, payload) {
+  const src = payload.sourceLabel || treeItemLabel(payload.sourceItem) || payload.sourcePath || "this branch";
+  const n = payload.sourceCount || treeItemCount(payload.sourceItem);
+  const photos = n > 0 ? `${n} photo${n === 1 ? "" : "s"}` : "photos";
+  if (action.type === "date") {
+    return `Set the date of ${photos} in “${src}” to ${friendlyTakenAt(action)}?`;
+  }
+  if (action.type === "place") {
+    if (payload.sourceGroupBy === "location" && payload.sourcePlaceLabel) {
+      const moved = relocatePlaceLabel(
+        payload.sourcePlaceLabel,
+        payload.sourcePlaceLabel,
+        action.place_label
+      );
+      return `Move “${src}” under “${action.place_label}”? Place [*,] ${payload.sourcePlaceLabel} becomes [*,] ${moved}.`;
+    }
+    return `Set the place of ${photos} in “${src}” to “${action.place_label}”?`;
+  }
+  if (action.type === "person") {
+    const dest = action.label || treeItemLabel(action.item) || "this person";
+    return `Merge “${src}” into “${dest}”? All faces in the dragged person will be assigned to ${dest}.`;
+  }
+  if (action.type === "collection-move") {
+    const dest = treeItemLabel(action.item) || "this collection";
+    return `Move collection “${src}” under “${dest}”?`;
+  }
+  if (action.type === "collection-relocate") {
+    const dest = treeItemLabel(action.item) || "this collection";
+    return `Move ${photos} to “${dest}”?`;
+  }
+  if (action.type === "collection-add") {
+    const dest =
+      action.folderId == null
+        ? "Collections"
+        : treeItemLabel(action.item) || "this collection";
+    if (payload.sourceGroupBy && payload.sourceGroupBy !== "collection") {
+      return `Add “${src}” (and its branches) to “${dest}”?`;
+    }
+    return `Add ${photos} from “${src}” to collection “${dest}”?`;
+  }
+  return "Apply this change to the dragged branch?";
+}
+
+function treeDropActionFromEl(el) {
+  if (!photoTreeDrag) return null;
+  const hasCards = !!photoTreeDrag.photos?.length;
+  const hasBranch = !!photoTreeDrag.sourceGroupBy;
+  if (!hasCards && !hasBranch) return null;
+  const item = el?.closest?.(".browse-item");
+  if (!item) return null;
+  if (item.classList.contains("browse-branch")) {
+    if (
+      item.dataset.branch === "collections" &&
+      photoTreeDrag.sourceGroupBy &&
+      photoTreeDrag.sourceGroupBy !== "collection"
+    ) {
+      return { type: "collection-add", folderId: null, item };
+    }
+    return null;
+  }
+  if (item === photoTreeDrag.sourceItem) return null;
+  const gb = item.dataset.groupBy;
+  const path = item.dataset.path;
+  if (gb === "date") {
+    const taken_at = takenAtFromDatePath(path);
+    if (taken_at) return { type: "date", taken_at, path, item };
+  } else if (gb === "location") {
+    const place_label = placeLabelFromLocationPath(path, item.dataset.kind || "");
+    if (!place_label) return null;
+    if (
+      photoTreeDrag.sourceGroupBy === "location" &&
+      photoTreeDrag.sourcePlaceLabel &&
+      isPlaceMoveIntoSelf(photoTreeDrag.sourcePlaceLabel, place_label)
+    ) {
+      return null;
+    }
+    return { type: "place", place_label, item };
+  } else if (gb === "person" && item.classList.contains("browse-person")) {
+    const targetId = Number(item.dataset.path);
+    const sourceId = photoTreeDrag.sourcePersonId;
+    if (!Number.isFinite(targetId) || targetId <= 0) return null;
+    if (sourceId == null || targetId === sourceId) return null;
+    const personBranch = photoTreeDrag.sourceGroupBy === "person";
+    if (!personBranch && !photoTreeDrag.faceIds?.length) return null;
+    const input = item.querySelector(".person-label");
+    return {
+      type: "person",
+      personId: targetId,
+      labeled: input?.dataset.labeled === "1",
+      label: (input?.dataset.displayName || input?.value || input?.textContent || "").trim(),
+      item,
+    };
+  } else if (gb === "collection") {
+    const targetId = Number(path);
+    if (!Number.isFinite(targetId) || targetId <= 0) return null;
+    if (item.dataset.linked === "1") return null;
+    if (photoTreeDrag.sourceGroupBy === "collection") {
+      const sourceId = Number(photoTreeDrag.sourcePath);
+      if (!Number.isFinite(sourceId) || sourceId === targetId) return null;
+      if (photoTreeDrag.sourceItem?.dataset.sourceSubdir === "1") return null;
+      if (
+        item.closest(".browse-subtree") &&
+        photoTreeDrag.sourceItem?.nextElementSibling?.contains(item)
+      ) {
+        return null;
+      }
+      return { type: "collection-move", folderId: targetId, item };
+    }
+    const fromId = photoTreeDrag.sourceCollectionId;
+    if (
+      fromId != null &&
+      fromId !== targetId &&
+      !photoTreeDrag.sourceGroupBy &&
+      sameCollectionTree(fromId, targetId)
+    ) {
+      return { type: "collection-relocate", folderId: targetId, fromId, item };
+    }
+    return { type: "collection-add", folderId: targetId, item };
+  }
+  return null;
+}
+
+function highlightTreeDropItem(item) {
+  $("#browse-groups")?.querySelectorAll(".browse-item.drop-ok").forEach((el) => {
+    if (el !== item) el.classList.remove("drop-ok");
+  });
+  if (!item) return;
+  item.classList.add("drop-ok");
+}
+
+function clearPhotoTreeDrag() {
+  photoTreeDrag = null;
+  document.body.classList.remove("is-photo-dragging", "drop-allowed");
+  highlightTreeDropItem(null);
+  $("#photo-map")?.classList.remove("map-drop-target");
+}
+
+async function fetchBranchPhotos(groupBy, key) {
+  let q = `group_by=${encodeURIComponent(groupBy)}&key=${encodeURIComponent(key)}${removeQuery()}&limit=10000`;
+  if (groupBy === "location" || groupBy === "date" || groupBy === "folder" || groupBy === "collection") {
+    q += `&include_subfolders=true`;
+  }
+  return api(`/api/browse/photos?${q}`);
+}
+
+async function resolveTreeDragPayload(payload, action) {
+  if (payload.photos?.length) return payload;
+  if (!payload.sourceGroupBy || payload.sourcePath == null) return payload;
+  const fetched = (await fetchBranchPhotos(payload.sourceGroupBy, payload.sourcePath)) || [];
+  let photos = fetched.filter((p) => p.id != null);
+  if (
+    action.type === "place" &&
+    payload.sourceGroupBy === "location" &&
+    payload.sourcePlaceLabel
+  ) {
+    const suffixFetched =
+      (await fetchBranchPhotos(
+        "location",
+        `place-suffix::${payload.sourcePlaceLabel}`
+      )) || [];
+    const byId = new Map(photos.map((p) => [p.id, p]));
+    for (const p of suffixFetched) {
+      if (p.id != null && !byId.has(p.id)) {
+        byId.set(p.id, p);
+        photos.push(p);
+      }
+    }
+  }
+  const next = { ...payload, photos };
+  if (action.type === "person" && payload.sourceGroupBy === "person") {
+    next.faceIds = [
+      ...new Set(photos.map((p) => Number(p.face_id)).filter((id) => id > 0)),
+    ];
+  }
+  return next;
+}
+
+async function applyPlaceRelocate(photos, sourceLabel, targetLabel) {
+  const byNew = new Map();
+  for (const p of photos) {
+    if (p.id == null) continue;
+    const cur = (p.place_label || "").trim();
+    const next = placeLabelMatchesSource(cur, sourceLabel)
+      ? relocatePlaceLabel(cur, sourceLabel, targetLabel)
+      : relocatePlaceLabel(sourceLabel, sourceLabel, targetLabel);
+    if (!next || next === cur) continue;
+    const ids = byNew.get(next);
+    if (ids) ids.push(p.id);
+    else byNew.set(next, [p.id]);
+  }
+  if (!byNew.size) return;
+  let lastPlace = null;
+  for (const [label, ids] of byNew) {
+    const res = await api("/api/photos/properties", {
+      method: "POST",
+      body: JSON.stringify({ photo_ids: ids, properties: { place_label: label } }),
+    });
+    if (res.errors?.length && !res.updated) {
+      throw new Error(res.errors[0].error || "Update failed");
+    }
+    lastPlace = res.place ?? lastPlace;
+  }
+  return lastPlace;
+}
+
+async function applyTreeDrop(action, payload) {
+  if (action.type === "collection-move") {
+    await api(`/api/collections/${payload.sourcePath}`, {
+      method: "PATCH",
+      body: JSON.stringify({ parent_id: action.folderId }),
+    });
+    await refreshExpandedBranches(["collections"]);
+    return;
+  }
+  if (action.type === "collection-relocate") {
+    payload = await resolveTreeDragPayload(payload, action);
+    const ids = (payload.photos || []).map((p) => p.id).filter((id) => id != null);
+    if (!ids.length) return;
+    await api(`/api/collections/${action.folderId}/members/move`, {
+      method: "POST",
+      body: JSON.stringify({
+        photo_ids: ids,
+        from_collection_id: action.fromId,
+      }),
+    });
+    await refreshExpandedBranches(["collections"]);
+    await reloadBrowseGallery();
+    return;
+  }
+  if (action.type === "collection-add") {
+    if (payload.sourceGroupBy && payload.sourcePath != null && payload.sourceGroupBy !== "collection") {
+      const culledQ = removeQuery();
+      const url =
+        action.folderId == null
+          ? `/api/collections/import-tree${culledQ ? `?${culledQ.slice(1)}` : ""}`
+          : `/api/collections/${action.folderId}/import-tree${culledQ ? `?${culledQ.slice(1)}` : ""}`;
+      await api(url, {
+        method: "POST",
+        body: JSON.stringify({
+          group_by: payload.sourceGroupBy,
+          key: String(payload.sourcePath),
+        }),
+      });
+      await refreshExpandedBranches(["collections"]);
+      const foldersRoot = $("#browse-groups")?.querySelector(
+        '.browse-branch[data-branch="collections"]'
+      );
+      if (foldersRoot && action.folderId == null) {
+        foldersRoot.dataset.loaded = "0";
+        await toggleBrowseBranch(foldersRoot, true);
+      }
+      return;
+    }
+    payload = await resolveTreeDragPayload(payload, action);
+    const ids = (payload.photos || []).map((p) => p.id).filter((id) => id != null);
+    if (!ids.length) return;
+    await api(`/api/collections/${action.folderId}/members`, {
+      method: "POST",
+      body: JSON.stringify({ photo_ids: ids }),
+    });
+    await refreshExpandedBranches(["collections"]);
+    return;
+  }
+  if (
+    action.type === "person" &&
+    payload.sourceGroupBy === "person" &&
+    payload.sourcePersonId
+  ) {
+    await api(`/api/people/${payload.sourcePersonId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ merge_into: action.personId }),
+    });
+    const named = action.labeled || isPersonNameLabeled(action.label);
+    await reloadAfterPeopleFaceEdit(
+      named && !payload.sourceLabeled
+        ? [payload.sourcePersonId, action.personId]
+        : []
+    );
+    return;
+  }
+  payload = await resolveTreeDragPayload(payload, action);
+  if (action.type === "date" || action.type === "place") {
+    const photos = payload.sourceGroupBy
+      ? (payload.photos || []).filter((p) => p.id != null)
+      : photosForPropertyDrop(payload.photos);
+    if (
+      action.type === "place" &&
+      payload.sourceGroupBy === "location" &&
+      payload.sourcePlaceLabel
+    ) {
+      const place = await applyPlaceRelocate(
+        photos,
+        payload.sourcePlaceLabel,
+        action.place_label
+      );
+      if (place !== undefined) {
+        await reloadBrowseAfterPropertyEdit({ place_label: action.place_label }, place);
+      }
+      return;
+    }
+    const ids = photos.map((p) => p.id);
+    if (!ids.length) return;
+    const properties =
+      action.type === "date"
+        ? { taken_at: action.taken_at }
+        : { place_label: action.place_label };
+    const res = await api("/api/photos/properties", {
+      method: "POST",
+      body: JSON.stringify({ photo_ids: ids, properties }),
+    });
+    if (res.errors?.length && !res.updated) {
+      throw new Error(res.errors[0].error || "Update failed");
+    }
+    await reloadBrowseAfterPropertyEdit(properties, res.place ?? null);
+    return;
+  }
+  if (action.type === "person") {
+    const faceIds = payload.faceIds || [];
+    if (!faceIds.length) return;
+    const recluster = new Set(
+      [payload.sourcePersonId, action.personId].filter((id) => id > 0)
+    );
+    for (const faceId of faceIds) {
+      const updated = await api(`/api/faces/${faceId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ person_id: action.personId }),
+      });
+      if (updated.id) recluster.add(Number(updated.id));
+    }
+    const named = action.labeled || isPersonNameLabeled(action.label);
+    await reloadAfterPeopleFaceEdit(
+      named && !payload.sourceLabeled ? [...recluster] : []
+    );
+  }
+}
+
+let pendingBranchDrop = null;
+
+function closeBranchDropConfirm() {
+  pendingBranchDrop = null;
+  const err = $("#branch-drop-confirm-error");
+  if (err) {
+    err.hidden = true;
+    err.textContent = "";
+  }
+  const btn = $("#btn-branch-drop-confirm");
+  if (btn) btn.disabled = false;
+  $("#branch-drop-confirm")?.close();
+}
+
+function openBranchDropConfirm(action, payload) {
+  pendingBranchDrop = { action, payload };
+  const dlg = $("#branch-drop-confirm");
+  const msg = $("#branch-drop-confirm-msg");
+  const err = $("#branch-drop-confirm-error");
+  const btn = $("#btn-branch-drop-confirm");
+  if (msg) msg.textContent = branchDropConfirmMessage(action, payload);
+  if (err) {
+    err.hidden = true;
+    err.textContent = "";
+  }
+  if (btn) btn.disabled = false;
+  dlg?.showModal();
+}
+
+$("#btn-branch-drop-cancel")?.addEventListener("click", () => closeBranchDropConfirm());
+$("#btn-branch-drop-no")?.addEventListener("click", () => closeBranchDropConfirm());
+$("#branch-drop-confirm")?.addEventListener("cancel", () => {
+  pendingBranchDrop = null;
+});
+$("#branch-drop-confirm-form")?.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const pending = pendingBranchDrop;
+  if (!pending) {
+    closeBranchDropConfirm();
+    return;
+  }
+  const err = $("#branch-drop-confirm-error");
+  const btn = $("#btn-branch-drop-confirm");
+  if (err) {
+    err.hidden = true;
+    err.textContent = "";
+  }
+  if (btn) btn.disabled = true;
+  try {
+    await applyTreeDrop(pending.action, pending.payload);
+    closeBranchDropConfirm();
+  } catch (ex) {
+    if (err) {
+      err.textContent = ex.message || "Update failed";
+      err.hidden = false;
+    } else {
+      alert(ex.message || "Update failed");
+    }
+    if (btn) btn.disabled = false;
+  }
+});
+
 function bindBrowseItemInteractions(root) {
   root.querySelectorAll("[data-browse-key]").forEach((el) => {
     el.addEventListener("mousedown", (e) => {
+      if (isCardHoverDetailEvent(e)) {
+        el.draggable = false;
+        window.addEventListener(
+          "mouseup",
+          () => {
+            el.draggable = true;
+          },
+          { once: true }
+        );
+        return;
+      }
       if (e.shiftKey) e.preventDefault();
     });
     el.addEventListener("mouseenter", () => {
@@ -3422,11 +6035,70 @@ function bindBrowseItemInteractions(root) {
     el.addEventListener("mouseleave", () => {
       if (timelineHoverKey === el.dataset.browseKey) setTimelineHoverKey(null);
     });
+    el.addEventListener("dragstart", (e) => {
+      if (isCardHoverDetailEvent(e)) {
+        e.preventDefault();
+        return;
+      }
+      const photos = photosForCardDrag(el.dataset.browseKey);
+      if (!photos.length) {
+        e.preventDefault();
+        return;
+      }
+      const sourcePersonId = selectedTreePersonIds()[0] ?? null;
+      const srcInput =
+        sourcePersonId != null
+          ? $("#browse-groups")?.querySelector(
+              `.person-label[data-person="${sourcePersonId}"]`
+            )
+          : null;
+      const sourceCollectionId = (() => {
+        const id = activeCollectionId();
+        if (id == null) return null;
+        return activeCollectionFlags().linked ? null : id;
+      })();
+      photoTreeDrag = {
+        photos,
+        faceIds: selectedPersonFaceIds(photos),
+        sourcePersonId,
+        sourceLabeled: srcInput?.dataset.labeled === "1",
+        sourceCollectionId,
+      };
+      e.dataTransfer.effectAllowed = sourceCollectionId != null ? "move" : "copy";
+      e.dataTransfer.setData("text/plain", "fotoman-photos");
+      document.body.classList.add("is-photo-dragging");
+      galleryDragSuppressClick = false;
+    });
+    el.addEventListener("dragend", () => {
+      clearPhotoTreeDrag();
+      galleryDragSuppressClick = true;
+      setTimeout(() => {
+        galleryDragSuppressClick = false;
+      }, 0);
+    });
     el.addEventListener("click", (e) => {
-      if (e.target.closest("th")) return;
+      if (galleryDragSuppressClick) {
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+      if (e.target.closest("th, .detail-cluster-toggle")) return;
       if (e.detail > 1) return;
+      if (isCardHoverDetailEvent(e) && hoverDetailHasSelection()) return;
       applyBrowseItemSelection(el.dataset.browseKey, e);
       syncBrowseSelectionDom(root);
+    });
+    el.addEventListener("contextmenu", (e) => {
+      if (e.target.closest("th")) return;
+      e.preventDefault();
+      const key = el.dataset.browseKey;
+      if (key && !browseSelected.has(key)) {
+        browseSelected.clear();
+        browseSelected.add(key);
+        browseAnchorKey = key;
+        syncBrowseSelectionDom(root);
+      }
+      openEditPropertiesModal();
     });
     el.addEventListener("dblclick", (e) => {
       e.preventDefault();
@@ -3440,10 +6112,11 @@ function bindBrowseItemInteractions(root) {
             }
           : null;
       const key = el.dataset.browseKey;
-      const sorted = sortedBrowseItems();
-      const idx = sorted.findIndex((p) => browseItemKey(p) === key);
-      const photo = idx >= 0 ? sorted[idx] : null;
-      const group = sorted.map((p) => {
+      // Left/right follow visible gallery cards; up/down walks the cluster.
+      const sequence = browseKeepersOnlyView() ? browseDisplayItems() : sortedBrowseItems();
+      const idx = sequence.findIndex((p) => browseItemKey(p) === key);
+      const photo = idx >= 0 ? sequence[idx] : null;
+      const group = sequence.map((p) => {
         const m = browseMediaUrls(p);
         return { src: m.original, orientation: orientationDeg(p), mirrored: isMirrored(p), photo: p };
       });
@@ -3459,6 +6132,66 @@ function bindBrowseItemInteractions(root) {
     });
   });
 }
+
+document.addEventListener("dragover", (e) => {
+  if (!photoTreeDrag) return;
+  const mapLl =
+    !photoTreeDrag.sourceGroupBy && photoTreeDrag.photos?.length
+      ? mapDropLatLngFromEvent(e)
+      : null;
+  const action = treeDropActionAtEvent(e);
+  e.preventDefault();
+  const allow = !!action || !!mapLl;
+  const moving =
+    action?.type === "collection-move" || action?.type === "collection-relocate";
+  e.dataTransfer.dropEffect = allow ? (moving ? "move" : "copy") : "none";
+  document.body.classList.toggle("drop-allowed", allow);
+  highlightTreeDropItem(action?.item || null);
+  $("#photo-map")?.classList.toggle("map-drop-target", !!mapLl);
+});
+
+document.addEventListener("dragenter", (e) => {
+  if (!photoTreeDrag) return;
+  e.preventDefault();
+});
+
+document.addEventListener("drop", (e) => {
+  if (!photoTreeDrag) return;
+  e.preventDefault();
+  const mapLl =
+    !photoTreeDrag.sourceGroupBy && photoTreeDrag.photos?.length
+      ? mapDropLatLngFromEvent(e)
+      : null;
+  const action = treeDropActionAtEvent(e);
+  const payload = photoTreeDrag;
+  clearPhotoTreeDrag();
+  if (mapLl) {
+    swallowNextClick();
+    applyMapPhotoDrop(payload.photos, mapLl).catch((err) => {
+      alert(err.message || "Update failed");
+    });
+    return;
+  }
+  if (!action) return;
+  swallowNextClick();
+  if (payload.sourceGroupBy) {
+    if (
+      action.type === "collection-add" ||
+      action.type === "collection-move" ||
+      action.type === "collection-relocate"
+    ) {
+      applyTreeDrop(action, payload).catch((err) => {
+        alert(err.message || "Update failed");
+      });
+      return;
+    }
+    openBranchDropConfirm(action, payload);
+    return;
+  }
+  applyTreeDrop(action, payload).catch((err) => {
+    alert(err.message || "Update failed");
+  });
+});
 
 function removeQuery() {
   return includeCulled() ? "&include_culled=true" : "";
@@ -3534,16 +6267,23 @@ function browseMediaInner(p, media) {
   </div>`;
 }
 
-function renderBrowseThumbCard(p) {
+function renderBrowseThumbCard(p, clusterCounts = null) {
   const media = browseMediaUrls(p);
   const key = browseItemKey(p);
   const removed = !!p.culled;
   const sel = browseSelected.has(key) ? " selected" : "";
   const hasFace = browseFaceBoxes(p).length ? " has-face" : "";
   const path = photoPath(p);
+  const clusterN =
+    clusterCounts && p.group_id != null ? clusterCounts.get(p.group_id) || 0 : 0;
+  const clusterBadge =
+    clusterN > 1
+      ? `<span class="cluster-badge" title="${clusterN} photos in cluster">${clusterN}</span>`
+      : "";
   return `
-      <article class="card${removed ? " removed" : ""}${sel}" data-browse-key="${key}" data-original="${media.original}" data-orientation="${orientationDeg(p)}" data-mirrored="${isMirrored(p) ? 1 : 0}"${faceBoxAttrs(p)}>
-        ${removed ? `<span class="removed-badge">REMOVE</span>` : ""}
+      <article class="card${removed ? " removed" : ""}${sel}" draggable="true" data-browse-key="${key}" data-original="${media.original}" data-orientation="${orientationDeg(p)}" data-mirrored="${isMirrored(p) ? 1 : 0}"${faceBoxAttrs(p)}>
+        ${removed ? `<span class="removed-badge">REJECTED</span>` : ""}
+        ${clusterBadge}
         <div class="card-media${hasFace}">
           ${browseMediaInner(p, media)}
           ${browseItemHoverDetail(p)}
@@ -3555,17 +6295,28 @@ function renderBrowseThumbCard(p) {
       </article>`;
 }
 
-function renderBrowseDetailRow(p) {
+function renderBrowseDetailRow(p, { member = false, clusterCount = 0, expanded = false } = {}) {
   const media = browseMediaUrls(p);
   const key = browseItemKey(p);
   const removed = !!p.culled;
   const sel = browseSelected.has(key) ? " selected" : "";
   const path = photoPath(p);
+  const memberClass = member ? " detail-cluster-member" : "";
+  const toggle =
+    !member && clusterCount > 1
+      ? `<button type="button" class="detail-cluster-toggle" aria-expanded="${expanded ? "true" : "false"}" aria-label="${expanded ? "Collapse" : "Expand"} cluster">${expanded ? "▼" : "▶"}</button>`
+      : `<span class="detail-cluster-spacer" aria-hidden="true"></span>`;
+  const countBadge =
+    !member && clusterCount > 1
+      ? `<span class="detail-cluster-count" title="${clusterCount} photos in cluster">${clusterCount}</span>`
+      : "";
   return `
-      <tr class="${removed ? "removed " : ""}${sel}" data-browse-key="${key}" data-original="${media.original}" data-orientation="${orientationDeg(p)}" data-mirrored="${isMirrored(p) ? 1 : 0}"${faceBoxAttrs(p)}>
+      <tr class="${removed ? "removed " : ""}${sel.trim()}${memberClass}" draggable="true" data-browse-key="${key}" data-original="${media.original}" data-orientation="${orientationDeg(p)}" data-mirrored="${isMirrored(p) ? 1 : 0}"${faceBoxAttrs(p)}${member && !expanded ? " hidden" : ""}>
         <td class="browse-detail-name">
+          ${toggle}
           <img loading="lazy" src="${media.thumb}" alt="" draggable="false" style="${orientationStyle(p)}" />
-          <span title="${path}">${basename(p.path)}${removed ? " · REMOVE" : ""}</span>
+          <span title="${path}">${basename(p.path)}${removed ? " · REJECTED" : ""}</span>
+          ${countBadge}
         </td>
         <td>${photoArchiveName(p) || "—"}</td>
         <td class="browse-detail-path" title="${path}">${path || "—"}</td>
@@ -3574,7 +6325,81 @@ function renderBrowseDetailRow(p) {
         <td>${p.place_label || "—"}</td>
         <td class="num">${formatBytes(p.size)}</td>
         <td class="num">${formatDims(p)}</td>
+        <td>${formatAspect(p)}</td>
       </tr>`;
+}
+
+function clusterDetailGroups(items) {
+  const groups = [];
+  const seen = new Map();
+  for (const p of items) {
+    const gid = p?.group_id;
+    if (gid == null) {
+      groups.push({ groupId: null, photos: [p] });
+      continue;
+    }
+    let g = seen.get(gid);
+    if (!g) {
+      g = { groupId: gid, photos: [] };
+      seen.set(gid, g);
+      groups.push(g);
+    }
+    g.photos.push(p);
+  }
+  for (const g of groups) {
+    if (g.photos.length < 2) continue;
+    g.photos.sort((a, b) => {
+      const ak = isClusterKeeper(a) ? 0 : 1;
+      const bk = isClusterKeeper(b) ? 0 : 1;
+      if (ak !== bk) return ak - bk;
+      return (Number(a.id) || 0) - (Number(b.id) || 0);
+    });
+  }
+  const { key, dir } = browseSort;
+  const mult = dir === "asc" ? 1 : -1;
+  groups.sort((a, b) => {
+    const av = browseSortValue(a.photos[0], key);
+    const bv = browseSortValue(b.photos[0], key);
+    if (av < bv) return -1 * mult;
+    if (av > bv) return 1 * mult;
+    return (basename(a.photos[0].path) || "").localeCompare(basename(b.photos[0].path) || "");
+  });
+  return groups;
+}
+
+function browseVisibleDetailKeys() {
+  const keys = [];
+  for (const g of clusterDetailGroups(browseDisplayItems())) {
+    if (!g.photos.length) continue;
+    keys.push(browseItemKey(g.photos[0]));
+    const expanded = g.groupId != null && detailsExpandedGroups.has(String(g.groupId));
+    if (expanded) {
+      for (let i = 1; i < g.photos.length; i++) keys.push(browseItemKey(g.photos[i]));
+    }
+  }
+  return keys;
+}
+
+function bindDetailClusterToggles(root) {
+  root.querySelectorAll(".detail-cluster-toggle").forEach((btn) => {
+    btn.addEventListener("mousedown", (e) => e.stopPropagation());
+    btn.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const tbody = btn.closest("tbody.detail-cluster");
+      const gid = tbody?.dataset.groupId;
+      if (gid == null || gid === "") return;
+      const expand = !detailsExpandedGroups.has(gid);
+      if (expand) detailsExpandedGroups.add(gid);
+      else detailsExpandedGroups.delete(gid);
+      btn.setAttribute("aria-expanded", expand ? "true" : "false");
+      btn.setAttribute("aria-label", expand ? "Collapse cluster" : "Expand cluster");
+      btn.textContent = expand ? "▼" : "▶";
+      tbody.querySelectorAll("tr.detail-cluster-member").forEach((tr) => {
+        tr.hidden = !expand;
+      });
+    });
+  });
 }
 
 function renderItemsWithMonthDividers(items, renderItem, dividerForKey) {
@@ -3593,7 +6418,12 @@ function renderItemsWithMonthDividers(items, renderItem, dividerForKey) {
 }
 
 function renderBrowseThumbs(items) {
-  return renderItemsWithMonthDividers(items, renderBrowseThumbCard, monthDividerHtml);
+  const clusterCounts = browseKeepersOnlyView() ? clusterCountsByGroupId() : null;
+  return renderItemsWithMonthDividers(
+    items,
+    (p) => renderBrowseThumbCard(p, clusterCounts),
+    monthDividerHtml
+  );
 }
 
 function renderBrowseDetails(items) {
@@ -3605,12 +6435,26 @@ function renderBrowseDetails(items) {
     (c) =>
       `<th data-sort="${c.key}" class="${browseSort.key === c.key ? "sorted" : ""}">${c.label}${sortIcon(c.key)}</th>`
   ).join("");
-  const rows = renderItemsWithMonthDividers(items, renderBrowseDetailRow, (mk) =>
-    monthDividerRowHtml(mk, BROWSE_DETAIL_COLS.length)
-  );
+  const bodies = clusterDetailGroups(items)
+    .map((g) => {
+      const expanded =
+        g.groupId != null && detailsExpandedGroups.has(String(g.groupId));
+      const count = g.photos.length;
+      const headRow = renderBrowseDetailRow(g.photos[0], {
+        clusterCount: count,
+        expanded,
+      });
+      const members = g.photos
+        .slice(1)
+        .map((p) => renderBrowseDetailRow(p, { member: true, expanded }))
+        .join("");
+      const gid = g.groupId != null ? String(g.groupId) : "";
+      return `<tbody class="detail-cluster" data-group-id="${gid}">${headRow}${members}</tbody>`;
+    })
+    .join("");
   return `<div class="browse-details-wrap"><table class="browse-details">
     <thead><tr>${head}</tr></thead>
-    <tbody>${rows}</tbody>
+    ${bodies}
   </table></div>`;
 }
 
@@ -3868,7 +6712,19 @@ function timelineSelectBuckets(lo, hi, { additive = false } = {}) {
     }
   }
   if (lastKey != null) browseAnchorKey = lastKey;
-  syncBrowseSelectionDom();
+  if (isDupesWorkspace()) {
+    if (!additive) dupeSelected.clear();
+    for (const key of rangeKeys) {
+      const id = Number(String(key).startsWith("id:") ? key.slice(3) : NaN);
+      if (Number.isFinite(id) && dupePhotosById.has(id)) dupeSelected.add(id);
+    }
+    document.querySelectorAll("#dupe-list .dupe-members [data-id]").forEach((el) => {
+      el.classList.toggle("selected", dupeSelected.has(Number(el.dataset.id)));
+    });
+    syncDupeToolbar();
+  } else {
+    syncBrowseSelectionDom();
+  }
   if (currentWorkspaceView() === "map") {
     fitMapToTimelineSelection(rangeKeys);
   } else {
@@ -3891,12 +6747,26 @@ function fitMapToTimelineSelection(keys) {
     }
   }
   if (!latlngs.length) return;
-  photoMap.fitBounds(L.latLngBounds(latlngs), { padding: [48, 48], maxZoom: 15 });
+  fitMapLatLngs(latlngs, { padding: [48, 48], maxZoom: 15 });
 }
 
 function scrollBrowseToFirstTimelineKey(keys) {
   if (!keys?.length) return;
   const want = new Set(keys);
+  if (isDupesWorkspace()) {
+    for (const key of keys) {
+      const id = Number(String(key).startsWith("id:") ? key.slice(3) : NaN);
+      if (!Number.isFinite(id)) continue;
+      const el = $("#dupe-list")?.querySelector(
+        `.dupe-members [data-id="${CSS.escape(String(id))}"]`
+      );
+      if (el) {
+        el.scrollIntoView({ block: "nearest", behavior: "smooth" });
+        return;
+      }
+    }
+    return;
+  }
   const first = browseDisplayItems().find((p) => want.has(browseItemKey(p)));
   const key = first ? browseItemKey(first) : keys[0];
   const root = $("#browse-results");
@@ -3924,9 +6794,20 @@ function renderTimelineNeedles() {
     return;
   }
   const parts = [];
-  const selectedOk = browseSelected.size > 0 && browseSelected.size <= 500;
+  let selectedKeys;
+  if (isDupesWorkspace()) {
+    selectedKeys = [...dupeSelected]
+      .map((id) => {
+        const p = dupePhotosById.get(id);
+        return p ? browseItemKey(p) : `id:${id}`;
+      })
+      .filter(Boolean);
+  } else {
+    selectedKeys = [...browseSelected];
+  }
+  const selectedOk = selectedKeys.length > 0 && selectedKeys.length <= 500;
   if (selectedOk) {
-    for (const key of browseSelected) {
+    for (const key of selectedKeys) {
       if (!timelineModel.itemTimes.has(key)) continue;
       const pct = timelineNeedlePct(timelineModel.itemTimes.get(key));
       if (pct == null) continue;
@@ -4068,6 +6949,15 @@ function onTimelinePointerUp(e) {
 
 function onTimelineContextMenu(e) {
   e.preventDefault();
+  if (isDupesWorkspace()) {
+    if (!dupeSelected.size) return;
+    dupeSelected.clear();
+    document.querySelectorAll("#dupe-list .dupe-members [data-id]").forEach((el) => {
+      el.classList.remove("selected");
+    });
+    syncDupeToolbar();
+    return;
+  }
   if (!browseSelected.size) return;
   browseSelected.clear();
   browseAnchorKey = null;
@@ -4217,7 +7107,7 @@ function renderBrowseResults() {
   if (!browseItems.length) {
     root.innerHTML =
       photoVisibility === "removed"
-        ? `<p class="muted">Removed is empty.</p>`
+        ? `<p class="muted">Rejected is empty.</p>`
         : photoVisibility === "selected"
           ? `<p class="muted">No photos selected.</p>`
           : `<p class="muted">No photos in this group.</p>`;
@@ -4231,7 +7121,9 @@ function renderBrowseResults() {
     root.innerHTML =
       photoVisibility === "selected"
         ? `<p class="muted">No photos selected.</p>`
-        : `<p class="muted">No photos to show (cluster replicas are hidden in this view).</p>`;
+        : currentAspectFilter()
+          ? `<p class="muted">No photos match this aspect.</p>`
+          : `<p class="muted">No photos to show (cluster replicas are hidden in this view).</p>`;
     updateBrowseSelectionCount();
     renderBrowseTimeline([]);
     applyBrowseTileSize();
@@ -4243,6 +7135,7 @@ function renderBrowseResults() {
 
   bindBrowseItemInteractions(root);
   if (browseGalleryView === "details") {
+    bindDetailClusterToggles(root);
     root.querySelectorAll("th[data-sort]").forEach((th) => {
       th.addEventListener("click", (e) => {
         e.stopPropagation();
@@ -4321,14 +7214,22 @@ function applyBrowseTreeSelection(item, e) {
 }
 
 function browseViewForGroupBy(groupBy) {
-  if (groupBy === "folder" || groupBy === "vfolder") return "folders";
+  if (groupBy === "folder") return "volumes";
+  if (groupBy === "collection") return "collections";
   if (groupBy === "person") return "people";
+  if (groupBy === "date") return "dates";
+  if (groupBy === "location") return "places";
+  if (groupBy === "camera") return "cameras";
   return groupBy;
 }
 
 function browseGroupByForBranch(branchId) {
-  if (branchId === "folders") return "folder";
+  if (branchId === "volumes") return "folder";
+  if (branchId === "collections") return "collection";
   if (branchId === "people") return "person";
+  if (branchId === "dates") return "date";
+  if (branchId === "places") return "location";
+  if (branchId === "cameras") return "camera";
   return branchId;
 }
 
@@ -4336,6 +7237,7 @@ function clearBrowseGallery() {
   browseActiveKey = null;
   browseActiveKeys = [];
   browseSelectionByGroup = {};
+  saveBrowseSelectionPref();
   browseItems = [];
   browseItemsFull = [];
   browseSearchActive = false;
@@ -4350,21 +7252,21 @@ function showLabeledImagesChecked() {
   return isPressOn($("#browse-show-nested"));
 }
 
-/** Nested-folder / date / place gallery scope (same checkbox as labeled people). */
+/** Nested-folder / date gallery scope (same checkbox as labeled people/places). */
 function showSubfoldersChecked() {
   return showLabeledImagesChecked();
 }
 
-/** Cardinal toggle label: labeled (People) vs nested (folders/dates/places). */
+/** Cardinal toggle label: labeled (People/Places) vs nested (folders/dates). */
 function syncBrowseNestedOptLabel() {
   const btn = $("#browse-show-nested");
   if (!btn) return;
   if (browseView === "people") {
-    btn.textContent = "Show labeled images";
-    btn.title = "Show labeled people instead of unlabeled / Unknown";
+    btn.textContent = "Show labeled people";
+    btn.title = "Show identified people or unlabeled faces";
   } else {
-    btn.textContent = "Show nested";
-    btn.title = "Include photos from nested folders, dates, or places";
+    btn.textContent = "Show nested images";
+    btn.title = "Include photos from sub-classified branches";
   }
 }
 
@@ -4374,6 +7276,19 @@ function cloneBrowseSelection(sel = browseSelectionByGroup) {
     if (Array.isArray(keys)) out[gb] = [...keys];
   }
   return out;
+}
+
+function browseSelectionEquals(a, b) {
+  const na = cloneBrowseSelection(a);
+  const nb = cloneBrowseSelection(b);
+  const keys = new Set([...Object.keys(na), ...Object.keys(nb)]);
+  for (const k of keys) {
+    const va = [...(na[k] || [])].map(String).sort();
+    const vb = [...(nb[k] || [])].map(String).sort();
+    if (va.length !== vb.length) return false;
+    if (va.some((x, i) => x !== vb[i])) return false;
+  }
+  return true;
 }
 
 function browseSelectionParticipates(sel = browseSelectionByGroup) {
@@ -4416,9 +7331,11 @@ function collectBrowseSelectionFromDom() {
     const gb = browseGroupByForBranch(branchId);
     hadSelection[gb] = true;
     if (selectionByGroup[gb]?.length) continue;
-    // People: checkbox filters labeled vs unlabeled, not nested scope — always
-    // load the filtered “all” set when the People root is selected.
-    if (branchId === "people" || showSub) selectionByGroup[gb] = ["all"];
+    // People / Places: checkbox filters labeled vs unlabeled, not nested scope —
+    // always load the filtered “all” set when the branch root is selected.
+    if (branchId === "people" || branchId === "places" || showSub) {
+      selectionByGroup[gb] = ["all"];
+    }
   }
 
   for (const gb of Object.keys(selectionByGroup)) {
@@ -4470,6 +7387,7 @@ async function activateSelectedBrowseTree(clickedItem) {
   if (emptyBranch) {
     browseSelectionByGroup = cloneBrowseSelection(selectionByGroup);
     syncBrowseActiveFromSelection();
+    saveBrowseSelectionPref();
     browseItems = [];
     browseItemsFull = [];
     browseSearchActive = false;
@@ -4477,24 +7395,70 @@ async function activateSelectedBrowseTree(clickedItem) {
     browseAnchorKey = null;
     const results = $("#browse-results");
     if (results) {
-      results.innerHTML = `<p class="muted">Turn on “Show nested” to include nested items.</p>`;
+      results.innerHTML = `<p class="muted">Turn on “Show labeled images” to include nested items.</p>`;
     }
     updateBrowseSelectionCount();
     refreshScopedWorkspaceViews();
     return;
   }
 
+  if (browseSelectionEquals(browseSelectionByGroup, selectionByGroup)) return;
+
   await loadBrowsePhotosFromSelection(selectionByGroup);
   refreshScopedWorkspaceViews();
+}
+
+function swallowNextClick() {
+  const swallowClick = (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+  };
+  document.addEventListener("click", swallowClick, true);
+  setTimeout(() => document.removeEventListener("click", swallowClick, true), 50);
 }
 
 function bindBrowseTreeRowClick(item) {
   item.addEventListener("mousedown", (e) => {
     if (e.shiftKey) e.preventDefault();
   });
+  if (isDraggableTreeBranch(item)) {
+    item.draggable = true;
+    item.addEventListener("dragstart", (e) => {
+      if (e.target.closest(".tree-label-edit, .browse-twistie:not(.spacer), button")) {
+        e.preventDefault();
+        return;
+      }
+      const gb = item.dataset.groupBy;
+      const path = item.dataset.path;
+      const personId = gb === "person" ? Number(path) : null;
+      photoTreeDrag = {
+        photos: [],
+        faceIds: [],
+        sourceItem: item,
+        sourceGroupBy: gb,
+        sourcePath: path,
+        sourceLabel: treeItemLabel(item),
+        sourcePlaceLabel:
+          gb === "location"
+            ? placeLabelFromLocationPath(path, item.dataset.kind || "")
+            : null,
+        sourceCount: treeItemCount(item),
+        sourcePersonId: Number.isFinite(personId) && personId > 0 ? personId : null,
+        sourceLabeled: item.querySelector(".person-label")?.dataset.labeled === "1",
+      };
+      e.dataTransfer.effectAllowed = gb === "collection" ? "move" : "copy";
+      e.dataTransfer.setData("text/plain", "fotoman-branch");
+      document.body.classList.add("is-photo-dragging");
+    });
+    item.addEventListener("dragend", () => {
+      clearPhotoTreeDrag();
+      swallowNextClick();
+    });
+  }
   item.addEventListener("click", async (e) => {
     if (e.target.closest(".browse-twistie:not(.spacer)")) return;
-    if (e.target.closest(".person-label")) return;
+    if (e.target.closest(".tree-label-edit")) return;
+    if (e.target.closest("button")) return;
     e.stopPropagation();
     applyBrowseTreeSelection(item, e);
     await activateSelectedBrowseTree(item);
@@ -4553,31 +7517,86 @@ function browseCountLabel(node) {
   return String(total);
 }
 
-function renderBrowseTree(nodes, container, groupBy, depth = 0) {
+function browseTreeOpenKey(item) {
+  if (!item) return null;
+  if (item.dataset.branch) return `branch:${item.dataset.branch}`;
+  const gb = item.dataset.groupBy || "";
+  const path = item.dataset.path;
+  if (path == null || path === "") return null;
+  return `${gb}:${path}`;
+}
+
+/** Reverse year/month/day rows in place (each item + its subtree stay paired). */
+function reverseBrowseTreeOrder(container) {
+  if (!container) return;
+  const nodes = [...container.children];
+  const groups = [];
+  for (let i = 0; i < nodes.length; ) {
+    const el = nodes[i];
+    if (!el.classList.contains("browse-item")) {
+      i += 1;
+      continue;
+    }
+    const next = nodes[i + 1];
+    if (next?.classList.contains("browse-subtree")) {
+      reverseBrowseTreeOrder(next);
+      groups.push([el, next]);
+      i += 2;
+    } else {
+      groups.push([el]);
+      i += 1;
+    }
+  }
+  for (let i = groups.length - 1; i >= 0; i--) {
+    for (const el of groups[i]) container.appendChild(el);
+  }
+}
+
+function collectOpenBrowseKeys(root) {
+  const keys = new Set();
+  if (!root) return keys;
+  root.querySelectorAll(".browse-item.has-children").forEach((item) => {
+    const sub = item.nextElementSibling;
+    if (!sub?.classList.contains("browse-subtree") || sub.hidden) return;
+    const key = browseTreeOpenKey(item);
+    if (key) keys.add(key);
+  });
+  return keys;
+}
+
+function renderBrowseTree(nodes, container, groupBy, depth = 0, openKeys = null) {
   nodes.forEach((node) => {
     const isFile = !!node.is_file;
     const hasChildren = !!node.children;
     const kind = node.kind || (String(node.path || "").startsWith("region::") ? "region" : "");
+    const open = !!(hasChildren && openKeys?.has(`${groupBy}:${node.path}`));
     const item = document.createElement("div");
     item.className =
       "browse-item" +
       (hasChildren ? " has-children" : "") +
       (isFile ? " is-file" : "") +
-      (kind === "region" ? " is-region" : "");
+      (kind === "region" ? " is-region" : "") +
+      (node.offline ? " is-offline" : "");
     item.dataset.path = node.path;
     item.dataset.groupBy = groupBy;
     if (kind) item.dataset.kind = kind;
+    if (node.offline) item.dataset.offline = "1";
     item.style.paddingLeft = `${depth * 0.8 + 0.4}rem`;
     const countHtml = isFile ? "" : `<span class="browse-item-count">${browseCountLabel(node)}</span>`;
-    item.innerHTML = `${browseTwistieHtml(hasChildren)}<span class="browse-item-name">${node.name}</span>${countHtml}`;
+    const isArchiveRoot = /:\s*$/.test(String(node.path || ""));
+    const offlineHtml =
+      node.offline && isArchiveRoot
+        ? `<span class="browse-offline-flag" title="Volume is unmounted">offline</span>`
+        : "";
+    item.innerHTML = `${browseTwistieHtml(hasChildren, open)}<span class="browse-item-name">${node.name}</span>${offlineHtml}${countHtml}`;
     bindBrowseTwistie(item, () => toggleBrowseSubtree(item));
     bindBrowseTreeRowClick(item);
     container.appendChild(item);
     if (hasChildren) {
       const subtree = document.createElement("div");
       subtree.className = "browse-subtree";
-      subtree.hidden = true;
-      renderBrowseTree(node.children, subtree, groupBy, depth + 1);
+      subtree.hidden = !open;
+      renderBrowseTree(node.children, subtree, groupBy, depth + 1, openKeys);
       container.appendChild(subtree);
     }
   });
@@ -4606,112 +7625,226 @@ function selectBrowseTreePath(path) {
   return item;
 }
 
-function bindPersonLabel(input) {
-  const save = async () => {
+function beginInlineTreeRename(span, onCommit, { allowEmpty = false } = {}) {
+  if (!span || span.tagName === "INPUT") return;
+  const prev = (span.dataset.displayName || span.textContent || "").trim();
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "tree-label-edit";
+  input.value = prev;
+  input.defaultValue = prev;
+  input.setAttribute("aria-label", span.getAttribute("aria-label") || "Rename");
+  for (const attr of span.attributes) {
+    if (attr.name.startsWith("data-")) input.setAttribute(attr.name, attr.value);
+  }
+  span.replaceWith(input);
+  input.focus();
+  input.select();
+
+  let done = false;
+  const restore = (label) => {
+    if (!input.isConnected) return;
+    const text = label ?? prev;
+    span.textContent = text;
+    if (span.dataset.displayName != null) span.dataset.displayName = text;
+    input.replaceWith(span);
+  };
+  const finish = async (commit) => {
+    if (done) return;
+    done = true;
     const next = input.value.trim();
-    const prev = input.defaultValue;
-    if (next === prev) return;
-    const personId = input.dataset.person;
-    const wasLabeled = input.dataset.labeled === "1";
-    const nextLabeled = isPersonNameLabeled(next);
-    const photoCount = Number(input.dataset.photoCount) || 0;
-
-    // Whole-group rename of an unlabeled/Unknown cluster — confirm when multi-photo.
-    if (!wasLabeled && nextLabeled && photoCount > 1) {
-      const ok = confirm(
-        `Assign “${next}” to all ${photoCount} photos in this group?\n\nTo label only some photos, select them and use Edit selection.`
-      );
-      if (!ok) {
-        input.value = prev;
-        return;
-      }
+    if (!commit || next === prev || (!allowEmpty && !next)) {
+      restore(prev);
+      return;
     }
-
-    const patch = async (merge) => {
-      const res = await fetch(`/api/people/${personId}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: next || null, merge }),
-      });
-      if (res.status === 409) {
-        const body = await res.json();
-        const err = new Error("name_conflict");
-        err.conflict = true;
-        err.existing = body.detail?.existing;
-        throw err;
-      }
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(text || res.statusText);
-      }
-      return res.json();
-    };
-
     try {
-      const updated = await patch(false);
-      input.value = updated.display_name;
-      input.defaultValue = updated.display_name;
-      input.dataset.displayName = updated.display_name;
-      input.dataset.labeled = updated.labeled ? "1" : "0";
-      input.title = `Person ${updated.id}`;
-      // Labeled filter may hide/show this row after status change.
-      if (wasLabeled !== !!updated.labeled) {
-        await fillPeopleBranch();
-        if (browseSelectionByGroup.person) {
-          const surviving = await restoreBrowseTreeSelection(cloneBrowseSelection());
-          if (Object.values(surviving).some((k) => k?.length)) {
-            await loadBrowsePhotosFromSelection(surviving);
-          } else {
-            clearBrowseGallery();
-          }
-        }
-      }
+      const result = await onCommit(next, { input, prev });
+      if (result?.replaced || !input.isConnected) return;
+      const label = result?.label ?? next;
+      if (result?.labeled != null) span.dataset.labeled = result.labeled ? "1" : "0";
+      restore(label);
     } catch (err) {
-      if (err.conflict && err.existing) {
-        const ex = err.existing;
-        const label = ex.display_name || next;
-        const ok = confirm(
-          `"${label}" already exists (${ex.photo_count} photos). Merge this person into them?`
-        );
-        if (!ok) {
-          input.value = prev;
-          return;
-        }
-        try {
-          const updated = await patch(true);
-          await fillPeopleBranch();
-          const kept = $("#browse-groups")?.querySelector(
-            `.person-label[data-person="${updated.id}"]`
-          );
-          const item = kept?.closest(".browse-item");
-          if (item) selectBrowseItem(item);
-          setBrowseContext("people", String(updated.id));
-          await loadBrowsePhotos("person", String(updated.id));
-        } catch (mergeErr) {
-          input.value = prev;
-          alert(mergeErr.message);
-        }
-        return;
-      }
-      input.value = prev;
-      alert(err.message);
+      restore(prev);
+      alert(err.message || "Rename failed");
     }
   };
   input.addEventListener("click", (e) => e.stopPropagation());
-  input.addEventListener("blur", save);
+  input.addEventListener("mousedown", (e) => e.stopPropagation());
+  input.addEventListener("dblclick", (e) => e.stopPropagation());
+  input.addEventListener("blur", () => finish(true));
   input.addEventListener("keydown", (e) => {
     if (e.key === "Enter") {
       e.preventDefault();
       input.blur();
     } else if (e.key === "Escape") {
-      input.value = input.defaultValue;
-      input.blur();
+      e.preventDefault();
+      finish(false);
     }
   });
 }
 
+let treeContextMenu = null;
+let treeContextMenuCloser = null;
+
+function closeTreeContextMenu() {
+  treeContextMenu?.remove();
+  treeContextMenu = null;
+  if (treeContextMenuCloser) {
+    document.removeEventListener("click", treeContextMenuCloser, true);
+    document.removeEventListener("contextmenu", treeContextMenuCloser, true);
+    document.removeEventListener("keydown", treeContextMenuCloser, true);
+    treeContextMenuCloser = null;
+  }
+}
+
+function openTreeContextMenu(e, items) {
+  e.preventDefault();
+  e.stopPropagation();
+  closeTreeContextMenu();
+  const menu = document.createElement("div");
+  menu.className = "tree-context-menu";
+  menu.setAttribute("role", "menu");
+  for (const it of items) {
+    if (it === "sep") {
+      menu.appendChild(document.createElement("hr"));
+      continue;
+    }
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.setAttribute("role", "menuitem");
+    btn.textContent = it.label;
+    if (it.danger) btn.classList.add("is-danger");
+    btn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      closeTreeContextMenu();
+      it.action();
+    });
+    menu.appendChild(btn);
+  }
+  document.body.appendChild(menu);
+  const pad = 8;
+  let x = e.clientX;
+  let y = e.clientY;
+  const rect = menu.getBoundingClientRect();
+  if (x + rect.width > window.innerWidth - pad) x = Math.max(pad, window.innerWidth - rect.width - pad);
+  if (y + rect.height > window.innerHeight - pad) y = Math.max(pad, window.innerHeight - rect.height - pad);
+  menu.style.left = `${Math.max(pad, x)}px`;
+  menu.style.top = `${Math.max(pad, y)}px`;
+  treeContextMenu = menu;
+  treeContextMenuCloser = (ev) => {
+    if (ev.type === "keydown" && ev.key !== "Escape") return;
+    if (ev.type !== "keydown" && menu.contains(ev.target)) return;
+    closeTreeContextMenu();
+  };
+  setTimeout(() => {
+    document.addEventListener("click", treeContextMenuCloser, true);
+    document.addEventListener("contextmenu", treeContextMenuCloser, true);
+    document.addEventListener("keydown", treeContextMenuCloser, true);
+  }, 0);
+}
+
+function bindPersonLabel(span) {
+  span.addEventListener("dblclick", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    beginInlineTreeRename(
+      span,
+      async (next, { input, prev }) => {
+        const personId = input.dataset.person;
+        const wasLabeled = input.dataset.labeled === "1";
+        const nextLabeled = isPersonNameLabeled(next);
+        const photoCount = Number(input.dataset.photoCount) || 0;
+
+        if (!wasLabeled && nextLabeled && photoCount > 1) {
+          const ok = confirm(
+            `Assign “${next}” to all ${photoCount} photos in this group?\n\nTo label only some photos, select them and use Edit selection.`
+          );
+          if (!ok) return { label: prev };
+        }
+
+        const patch = async (merge) => {
+          const res = await fetch(`/api/people/${personId}`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name: next || null, merge }),
+          });
+          if (res.status === 409) {
+            const body = await res.json();
+            const err = new Error("name_conflict");
+            err.conflict = true;
+            err.existing = body.detail?.existing;
+            throw err;
+          }
+          if (!res.ok) {
+            const text = await res.text();
+            throw new Error(text || res.statusText);
+          }
+          return res.json();
+        };
+
+        try {
+          const updated = await patch(false);
+          span.dataset.displayName = updated.display_name;
+          span.dataset.labeled = updated.labeled ? "1" : "0";
+          if (wasLabeled !== !!updated.labeled) {
+            await fillPeopleBranch();
+            if (browseSelectionByGroup.person) {
+              const surviving = await restoreBrowseTreeSelection(cloneBrowseSelection());
+              if (Object.values(surviving).some((k) => k?.length)) {
+                await loadBrowsePhotosFromSelection(surviving);
+              } else {
+                clearBrowseGallery();
+              }
+            }
+            return { replaced: true };
+          }
+          return { label: updated.display_name, labeled: updated.labeled };
+        } catch (err) {
+          if (err.conflict && err.existing) {
+            const ex = err.existing;
+            const label = ex.display_name || next;
+            const ok = confirm(
+              `"${label}" already exists (${ex.photo_count} photos). Merge this person into them?`
+            );
+            if (!ok) return { label: prev };
+            const updated = await patch(true);
+            await fillPeopleBranch();
+            const kept = $("#browse-groups")?.querySelector(
+              `.person-label[data-person="${updated.id}"]`
+            );
+            const item = kept?.closest(".browse-item");
+            if (item) selectBrowseItem(item);
+            setBrowseContext("people", String(updated.id));
+            await loadBrowsePhotos("person", String(updated.id));
+            return { replaced: true };
+          }
+          throw err;
+        }
+      },
+      { allowEmpty: true }
+    );
+  });
+}
+
+function peopleBranchItem() {
+  return $("#browse-groups")?.querySelector('.browse-branch[data-branch="people"]');
+}
+
 function peopleBranchContainer() {
+  const item = peopleBranchItem();
+  const next = item?.nextElementSibling;
+  if (next?.classList.contains("browse-subtree")) return next;
   return $("#browse-groups")?.querySelector('.browse-subtree[data-branch="people"]');
+}
+
+async function refreshPeopleBranchIfLoaded() {
+  const item = peopleBranchItem();
+  if (item?.dataset.loaded !== "1") return;
+  await fillPeopleBranch();
+}
+
+function locationBranchContainer() {
+  return $("#browse-groups")?.querySelector('.browse-subtree[data-branch="places"]');
 }
 
 function escHtml(s) {
@@ -4721,62 +7854,202 @@ function escHtml(s) {
     .replace(/"/g, "&quot;");
 }
 
-function activeVirtualFolderId() {
-  const keys = browseSelectionByGroup.vfolder;
+function activeCollectionId() {
+  const keys = browseSelectionByGroup.collection;
   if (!keys?.length) return null;
   const id = Number(keys[0]);
   return Number.isFinite(id) ? id : null;
 }
 
-function renderVirtualFolders(folders, container) {
+function collectionTreeRootId(collectionId) {
+  const id = Number(collectionId);
+  if (!Number.isFinite(id) || id <= 0) return null;
+  let item = document.querySelector(`.browse-collection[data-path="${id}"]`);
+  if (!item) return id;
+  while (true) {
+    const sub = item.parentElement;
+    if (!sub?.classList.contains("browse-subtree")) break;
+    const parent = sub.previousElementSibling;
+    if (!parent?.classList.contains("browse-collection")) break;
+    item = parent;
+  }
+  const root = Number(item.dataset.path);
+  return Number.isFinite(root) ? root : id;
+}
+
+function sameCollectionTree(aId, bId) {
+  const a = collectionTreeRootId(aId);
+  const b = collectionTreeRootId(bId);
+  return a != null && b != null && a === b;
+}
+
+function activeCollectionFlags() {
+  const id = activeCollectionId();
+  if (id == null) return { linked: false, sourceSubdir: false };
+  const item = document.querySelector(`.browse-collection[data-path="${id}"]`);
+  return {
+    linked: item?.dataset.linked === "1",
+    sourceSubdir: item?.dataset.sourceSubdir === "1",
+  };
+}
+
+function flattenCollections(folders, prefix = "") {
+  const out = [];
+  for (const f of folders || []) {
+    const label = prefix ? `${prefix} / ${f.name}` : f.name;
+    out.push({ ...f, pathLabel: label });
+    if (f.children?.length) out.push(...flattenCollections(f.children, label));
+  }
+  return out;
+}
+
+async function exportCollectionAsArchive(folder) {
+  if (!folder?.id) return;
+  const countEl = $("#browse-gallery-count");
+  const prevCount = countEl?.textContent || "";
+  try {
+    const picked = await api(
+      `/api/pick-directory?title=${encodeURIComponent("Export collection")}`,
+      { method: "POST" }
+    );
+    if (picked.cancelled || !picked.path) return;
+    if (countEl) countEl.textContent = `Exporting “${folder.name}”…`;
+    const culledQ = removeQuery();
+    const res = await api(
+      `/api/collections/${folder.id}/export${culledQ ? `?${culledQ.slice(1)}` : ""}`,
+      {
+        method: "POST",
+        body: JSON.stringify({ dest: picked.path, write_mtime: true }),
+      }
+    );
+    const parts = [`Exported ${res.exported || res.copied || 0}`];
+    if (res.skipped) parts.push(`${res.skipped} already there`);
+    if (res.failed) parts.push(`${res.failed} failed`);
+    if (res.pending) parts.push(`${res.pending} still pending`);
+    if (countEl) countEl.textContent = `${parts.join("; ")} → ${res.dest || picked.path}`;
+    await loadSources();
+    await refreshExpandedBranches(["collections", "volumes"]);
+  } catch (err) {
+    alert(err.message || "Export failed");
+    if (countEl) countEl.textContent = prevCount;
+  }
+}
+
+async function deleteCollection(folder) {
+  const kind = folder.parent_id != null ? "subfolder" : "collection";
+  if (!confirm(`Delete ${kind} “${folder.name}” and its subfolders? Photos stay in the library.`)) return;
+  try {
+    await api(`/api/collections/${folder.id}`, { method: "DELETE" });
+    const vkeys = browseSelectionByGroup.collection || [];
+    if (vkeys.map(String).includes(String(folder.id))) {
+      clearBrowseGallery();
+    }
+    await refreshExpandedBranches(["collections"]);
+  } catch (err) {
+    alert(err.message || "Delete failed");
+  }
+}
+
+function bindCollectionItemMenu(item, folder) {
+  item.addEventListener("contextmenu", (e) => {
+    if (e.target.closest(".tree-label-edit")) return;
+    if (!item.classList.contains("selected")) {
+      applyBrowseTreeSelection(item, { ctrlKey: false, metaKey: false, shiftKey: false });
+      activateSelectedBrowseTree(item);
+    }
+    const kind = folder.parent_id != null ? "subfolder" : "collection";
+    const linked = !!folder.linked;
+    const sourceSubdir = !!folder.source_subdir;
+    const items = [];
+    if (!linked) {
+      items.push({ label: "Add subfolder", action: () => promptNewCollection(folder.id) });
+    }
+    items.push({ label: "Export", action: () => exportCollectionAsArchive(folder) });
+    if (folder.share_url || folder.share_code) {
+      items.push({
+        label: "Fotomob link",
+        action: () =>
+          openShareInfoDialog({
+            name: folder.name,
+            url: folder.share_url || folder.share_code || "",
+          }),
+      });
+    }
+    if (!sourceSubdir) {
+      items.push("sep");
+      items.push({
+        label: kind === "subfolder" ? "Delete subfolder" : "Delete collection",
+        danger: true,
+        action: () => deleteCollection(folder),
+      });
+    }
+    openTreeContextMenu(e, items);
+  });
+}
+
+function renderCollections(folders, container, depth = 1, openKeys = null) {
   if (!folders?.length) return;
   folders.forEach((f) => {
+    const kids = f.children || [];
+    const hasChildren = kids.length > 0;
+    const open = !!(hasChildren && openKeys?.has(`collection:${f.id}`));
+    const linked = !!f.linked;
+    const sourceSubdir = !!f.source_subdir;
+    const linkedRoot = linked && !sourceSubdir;
     const item = document.createElement("div");
-    item.className = "browse-item browse-vfolder";
+    item.className =
+      "browse-item browse-collection" +
+      (hasChildren ? " has-children" : "") +
+      (linked ? " is-linked" : "") +
+      (linkedRoot ? " is-linked-root" : "");
     item.dataset.path = String(f.id);
-    item.dataset.groupBy = "vfolder";
-    item.style.paddingLeft = "1.2rem";
-    item.innerHTML = `${browseTwistieHtml(false)}<span class="browse-item-name" title="Double-click to rename">${escHtml(f.name)}</span>
-      <span class="browse-item-count">${f.count ?? 0}</span>
-      <button type="button" class="vfolder-delete" title="Delete folder" aria-label="Delete folder">✕</button>`;
+    item.dataset.groupBy = "collection";
+    item.dataset.linked = linked ? "1" : "0";
+    item.dataset.sourceSubdir = sourceSubdir ? "1" : "0";
+    item.style.paddingLeft = `${depth * 0.8 + 0.4}rem`;
+    item.innerHTML = `${browseTwistieHtml(hasChildren, open)}<span class="browse-item-name"${
+      sourceSubdir
+        ? ' title="Linked child — edit in the source tree"'
+        : ' title="Double-click to rename"'
+    }>${escHtml(f.name)}</span>
+      <span class="browse-item-count">${browseCountLabel(f)}</span>`;
     const nameEl = item.querySelector(".browse-item-name");
-    nameEl?.addEventListener("dblclick", async (e) => {
-      e.stopPropagation();
-      const next = prompt("Rename folder", f.name);
-      if (next == null) return;
-      const label = next.trim();
-      if (!label || label === f.name) return;
-      try {
-        await api(`/api/virtual-folders/${f.id}`, {
-          method: "PATCH",
-          body: JSON.stringify({ name: label }),
+    if (!sourceSubdir) {
+      nameEl?.addEventListener("dblclick", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        beginInlineTreeRename(nameEl, async (label) => {
+          await api(`/api/collections/${f.id}`, {
+            method: "PATCH",
+            body: JSON.stringify({ name: label }),
+          });
+          await refreshExpandedBranches(["collections"]);
+          return { replaced: true };
         });
-        await refreshExpandedBranches(["folders"]);
-      } catch (err) {
-        alert(err.message || "Rename failed");
-      }
-    });
-    item.querySelector(".vfolder-delete")?.addEventListener("click", async (e) => {
-      e.stopPropagation();
-      if (!confirm(`Delete virtual folder “${f.name}”? Photos stay in the library.`)) return;
-      try {
-        await api(`/api/virtual-folders/${f.id}`, { method: "DELETE" });
-        const vkeys = browseSelectionByGroup.vfolder || [];
-        if (vkeys.map(String).includes(String(f.id))) {
-          clearBrowseGallery();
-        }
-        await refreshExpandedBranches(["folders"]);
-      } catch (err) {
-        alert(err.message || "Delete failed");
-      }
-    });
+      });
+    }
+    bindCollectionItemMenu(item, f);
+    bindBrowseTwistie(item, () => toggleBrowseSubtree(item));
     bindBrowseTreeRowClick(item);
     container.appendChild(item);
+    if (hasChildren) {
+      const subtree = document.createElement("div");
+      subtree.className = "browse-subtree";
+      subtree.hidden = !open;
+      renderCollections(kids, subtree, depth + 1, openKeys);
+      container.appendChild(subtree);
+    }
   });
 }
 
 async function fillPeopleBranch(container = peopleBranchContainer()) {
   if (!container) return;
+  // Branch header is a sibling of the subtree — never replace "People" with person rows.
+  if (container.classList.contains("browse-branch")) {
+    const sub = container.nextElementSibling;
+    if (!sub?.classList.contains("browse-subtree")) return;
+    container = sub;
+  }
   const labeled = showLabeledImagesChecked();
   const people = await api(`/api/browse/people?labeled=${labeled ? "true" : "false"}`);
   container.innerHTML = "";
@@ -4803,10 +8076,9 @@ async function fillPeopleBranch(container = peopleBranchContainer()) {
     item.innerHTML = `
       ${browseTwistieHtml(false)}
       ${faceSrc ? `<img class="person-face" src="${faceSrc}" alt="" loading="lazy" draggable="false" />` : `<span class="person-face person-face-empty"></span>`}
-      <input class="person-label" type="text" value="${esc(p.display_name)}"
-        data-person="${p.id}" data-labeled="${p.labeled ? "1" : "0"}"
+      <span class="person-label browse-item-name" data-person="${p.id}" data-labeled="${p.labeled ? "1" : "0"}"
         data-display-name="${esc(p.display_name)}" data-photo-count="${p.photo_count}"
-        title="Person ${p.id}" aria-label="Person name" />
+        title="Double-click to rename" aria-label="Person name">${esc(p.display_name)}</span>
       <span class="browse-item-count">${p.photo_count}</span>`;
     bindBrowseTreeRowClick(item);
     bindPersonLabel(item.querySelector(".person-label"));
@@ -4814,42 +8086,58 @@ async function fillPeopleBranch(container = peopleBranchContainer()) {
   });
 }
 
-async function fillBranchChildren(branchId, container) {
-  container.innerHTML = `<p class="muted" style="padding:0.35rem 0.6rem">Loading…</p>`;
+async function fillPlacesBranch(container = locationBranchContainer(), openKeys = null) {
+  if (!container) return;
+  const preserved = openKeys || collectOpenBrowseKeys(container);
+  const culledQ = removeQuery();
+  const tree = await api(`/api/browse/location-tree${culledQ ? `?${culledQ.slice(1)}` : ""}`);
+  container.innerHTML = "";
+  if (!tree.length) {
+    container.innerHTML = `<p class="muted" style="padding:0.35rem 0.6rem">No places. Index GPS or folder-named places first.</p>`;
+    return;
+  }
+  renderBrowseTree(tree, container, "location", 1, preserved);
+}
+
+async function fillBranchChildren(branchId, container, openKeys = null) {
+  const preserved = openKeys || collectOpenBrowseKeys(container);
+  if (!container.querySelector(".browse-item")) {
+    container.innerHTML = loadingMarkup("Loading", "sm");
+  }
   try {
-    if (branchId === "folders") {
-      // Never list individual images in the tree — only folders.
+    if (branchId === "collections") {
       const culledQ = removeQuery();
-      const [folders, tree] = await Promise.all([
-        api(`/api/virtual-folders${culledQ ? `?${culledQ.slice(1)}` : ""}`),
-        api(`/api/browse/tree?include_files=false${culledQ}`),
-      ]);
+      const folders = await api(`/api/collections${culledQ ? `?${culledQ.slice(1)}` : ""}`);
       container.innerHTML = "";
-      if (!(folders || []).length && !(tree || []).length) {
-        container.innerHTML = `<p class="muted" style="padding:0.35rem 0.6rem">No archives or photos found.</p>`;
+      if (!(folders || []).length) {
+        container.innerHTML = `<p class="muted" style="padding:0.35rem 0.6rem">No collections yet. Right-click Collections to create one.</p>`;
         return;
       }
-      renderVirtualFolders(folders || [], container);
-      if (tree?.length) renderBrowseTree(tree, container, "folder", 1);
-    } else if (branchId === "date") {
+      renderCollections(folders || [], container, 1, preserved);
+    } else if (
+      branchId === "volumes"
+    ) {
+      const culledQ = removeQuery();
+      const tree = await api(`/api/browse/tree?include_files=false${culledQ}`);
+      container.innerHTML = "";
+      if (!(tree || []).length) {
+        container.innerHTML = `<p class="muted" style="padding:0.35rem 0.6rem">No volumes or photos found.</p>`;
+        return;
+      }
+      renderBrowseTree(tree, container, "folder", 1, preserved);
+    } else if (branchId === "dates") {
       const tree = await api(`/api/browse/date-tree?${removeQuery().slice(1)}`);
       container.innerHTML = "";
       if (!tree.length) {
         container.innerHTML = `<p class="muted" style="padding:0.35rem 0.6rem">No dated photos found.</p>`;
         return;
       }
-      renderBrowseTree(tree, container, "date", 1);
-    } else if (branchId === "location") {
-      const tree = await api(`/api/browse/location-tree?${removeQuery().slice(1)}`);
-      container.innerHTML = "";
-      if (!tree.length) {
-        container.innerHTML = `<p class="muted" style="padding:0.35rem 0.6rem">No places. Index GPS or folder-named places first.</p>`;
-        return;
-      }
-      renderBrowseTree(tree, container, "location", 1);
+      renderBrowseTree(tree, container, "date", 1, preserved);
+    } else if (branchId === "places") {
+      await fillPlacesBranch(container, preserved);
     } else if (branchId === "people") {
       await fillPeopleBranch(container);
-    } else if (branchId === "camera") {
+    } else if (branchId === "cameras") {
       const groups = await api(`/api/browse/groups?group_by=camera${removeQuery()}`);
       container.innerHTML = "";
       if (!groups.length) {
@@ -4873,7 +8161,7 @@ async function fillBranchChildren(branchId, container) {
   }
 }
 
-async function toggleBrowseBranch(branchEl, forceOpen = null) {
+async function toggleBrowseBranch(branchEl, forceOpen = null, openKeys = null) {
   const subtree = branchEl.nextElementSibling;
   const branchId = branchEl.dataset.branch;
   const open = forceOpen == null ? subtree.hidden : forceOpen;
@@ -4885,7 +8173,7 @@ async function toggleBrowseBranch(branchEl, forceOpen = null) {
   subtree.hidden = false;
   setBrowseTwistie(branchEl, true);
   if (branchEl.dataset.loaded !== "1") {
-    await fillBranchChildren(branchId, subtree);
+    await fillBranchChildren(branchId, subtree, openKeys);
     branchEl.dataset.loaded = "1";
   }
 }
@@ -4908,6 +8196,30 @@ async function refreshExpandedBranches(branchIds = null) {
   }
 }
 
+async function promptNewCollection(parentId = null) {
+  const next = prompt(parentId == null ? "New collection name" : "New subfolder name", "");
+  if (next == null) return;
+  const label = next.trim();
+  if (!label) return;
+  try {
+    await api("/api/collections", {
+      method: "POST",
+      body: JSON.stringify({ name: label, parent_id: parentId }),
+    });
+    const foldersRoot = $("#browse-groups")?.querySelector(
+      '.browse-branch[data-branch="collections"]'
+    );
+    if (parentId == null && foldersRoot) {
+      foldersRoot.dataset.loaded = "0";
+      await toggleBrowseBranch(foldersRoot, true);
+    } else {
+      await refreshExpandedBranches(["collections"]);
+    }
+  } catch (err) {
+    alert(err.message || "Create failed");
+  }
+}
+
 function createBrowseBranch(branch) {
   const item = document.createElement("div");
   item.className = "browse-item browse-branch has-children";
@@ -4924,16 +8236,37 @@ function createBrowseBranch(branch) {
     await toggleBrowseBranch(item);
   });
   bindBrowseTreeRowClick(item);
+  if (branch.id === "dates") {
+    item.addEventListener("dblclick", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dateTreeOrder = dateTreeOrder === "newest" ? "oldest" : "newest";
+      const subtree = item.nextElementSibling;
+      if (subtree?.classList.contains("browse-subtree")) reverseBrowseTreeOrder(subtree);
+      api("/api/settings", {
+        method: "POST",
+        body: JSON.stringify({ date_tree_order: dateTreeOrder }),
+      }).catch(() => {});
+    });
+  }
+  if (branch.id === "collections") {
+    item.addEventListener("contextmenu", (e) => {
+      openTreeContextMenu(e, [
+        { label: "Add collection", action: () => promptNewCollection(null) },
+      ]);
+    });
+  }
 
   return { item, subtree };
 }
 
 const BROWSE_TREE_BRANCHES = [
-  { id: "folders", label: "Folders" },
-  { id: "date", label: "Dates" },
-  { id: "location", label: "Places" },
+  { id: "volumes", label: "Volumes" },
+  { id: "collections", label: "Collections" },
+  { id: "dates", label: "Dates" },
+  { id: "places", label: "Places" },
   { id: "people", label: "People" },
-  { id: "camera", label: "Cameras" },
+  { id: "cameras", label: "Cameras" },
 ];
 
 async function pollFacesStatus() {
@@ -4943,10 +8276,7 @@ async function pollFacesStatus() {
     const bar = $("#index-status");
     if (bar) bar.textContent = indexStatusText(lastIndexStatus, lastSources, st);
     applyIndexStatusToSources(lastIndexStatus, lastSources, st);
-    if (!st.running) {
-      const peopleRoot = $("#browse-groups")?.querySelector('.browse-branch[data-branch="people"]');
-      if (peopleRoot?.dataset.loaded === "1") await fillPeopleBranch();
-    }
+    if (!st.running) await refreshPeopleBranchIfLoaded();
   } catch {
     /* ignore */
   }
@@ -4985,6 +8315,7 @@ async function loadBrowseView(opts = {}) {
       if (emptyBranch) {
         browseSelectionByGroup = surviving;
         syncBrowseActiveFromSelection();
+        saveBrowseSelectionPref();
         return;
       }
       const hasKeys = Object.values(surviving).some((k) => k?.length);
@@ -4999,8 +8330,8 @@ async function loadBrowseView(opts = {}) {
   }
 
   const restoreId =
-    browseView === "folders"
-      ? "folders"
+    browseView === "volumes"
+      ? "volumes"
       : browseView === "people"
         ? "people"
         : browseView;
@@ -5009,7 +8340,7 @@ async function loadBrowseView(opts = {}) {
     await toggleBrowseBranch(root, true);
     if (browseActiveKey === "all") {
       selectBrowseItem(root);
-      if (restoreId === "people" || showSubfoldersChecked()) {
+      if (restoreId === "people" || restoreId === "places" || showSubfoldersChecked()) {
         await loadBrowsePhotos(browseGroupBy(), "all");
       } else clearBrowseGallery();
     } else if (browseActiveKey) {
@@ -5032,16 +8363,17 @@ async function fetchBrowsePhotosForKey(groupBy, key) {
     groupBy === "location" ||
     groupBy === "date" ||
     groupBy === "camera" ||
+    groupBy === "aspect" ||
     groupBy === "folder" ||
-    groupBy === "vfolder"
+    groupBy === "collection"
   ) {
     // Large groups exceed the default 200; truncation breaks cross-branch AND
     // (e.g. China ∩ 2025) and drops older bursts from Clusters/Regroup scope.
     q += `&limit=10000`;
-    if (groupBy === "folder" || groupBy === "location" || groupBy === "date") {
+    if (groupBy === "folder" || groupBy === "location" || groupBy === "date" || groupBy === "collection") {
       q += `&include_subfolders=${showSubfoldersChecked() ? "true" : "false"}`;
     }
-    if (groupBy === "person" && key === "all") {
+    if ((groupBy === "person" || groupBy === "location") && key === "all") {
       q += `&labeled=${showLabeledImagesChecked() ? "true" : "false"}`;
     }
   }
@@ -5051,30 +8383,35 @@ async function fetchBrowsePhotosForKey(groupBy, key) {
 async function loadAllRemovedPhotos() {
   const gen = ++browseLoadGen;
   browseSelectionByGroup = {};
+  saveBrowseSelectionPref();
   syncBrowseActiveFromSelection();
   browseSelected.clear();
   browseAnchorKey = null;
-  const results = $("#browse-results");
-  if (results) results.innerHTML = `<p class="muted">Loading…</p>`;
+  showBrowseLoading();
   updateBrowseSelectionCount();
-  const items = await api(`/api/browse/photos?group_by=remove&key=all&limit=500`);
-  if (gen !== browseLoadGen) return;
-  browseItems = filterByPhotoVisibility(items || []);
-  browseItemsFull = browseItems.slice();
-  browseSearchActive = false;
-  renderBrowseResults();
-  refreshScopedWorkspaceViews();
+  try {
+    const items = await api(`/api/browse/photos?group_by=remove&key=all&limit=500`);
+    if (gen !== browseLoadGen) return;
+    browseItems = filterByPhotoVisibility(items || []);
+    browseItemsFull = browseItems.slice();
+    browseSearchActive = false;
+    renderBrowseResults();
+    refreshScopedWorkspaceViews();
+  } finally {
+    if (gen === browseLoadGen) setRegroupBusy(false);
+  }
 }
 
 /** OR within each groupBy, AND across groupBy branches. */
 async function loadBrowsePhotosFromSelection(selectionByGroup) {
   const gen = ++browseLoadGen;
   browseSelectionByGroup = cloneBrowseSelection(selectionByGroup);
+  saveBrowseSelectionPref();
   syncBrowseActiveFromSelection();
   browseSelected.clear();
   browseAnchorKey = null;
   const results = $("#browse-results");
-  results.innerHTML = `<p class="muted">Loading…</p>`;
+  showBrowseLoading();
   updateBrowseSelectionCount();
 
   const participating = Object.entries(browseSelectionByGroup).filter(([, keys]) =>
@@ -5087,6 +8424,7 @@ async function loadBrowsePhotosFromSelection(selectionByGroup) {
     browseSearchActive = false;
     results.innerHTML = "";
     updateBrowseSelectionCount();
+    setRegroupBusy(false);
     return;
   }
   for (const [, keys] of participating) {
@@ -5095,12 +8433,14 @@ async function loadBrowsePhotosFromSelection(selectionByGroup) {
       browseItems = [];
       browseItemsFull = [];
       browseSearchActive = false;
-      results.innerHTML = `<p class="muted">Turn on “Show nested” to include nested items.</p>`;
+      results.innerHTML = `<p class="muted">Turn on “Show labeled images” to include nested items.</p>`;
       updateBrowseSelectionCount();
+      setRegroupBusy(false);
       return;
     }
   }
 
+  try {
   const branchMaps = await Promise.all(
     participating.map(async ([groupBy, keys]) => {
       const batches = await Promise.all(
@@ -5177,6 +8517,9 @@ async function loadBrowsePhotosFromSelection(selectionByGroup) {
   browseItemsFull = browseItems.slice();
   browseSearchActive = false;
   renderBrowseResults();
+  } finally {
+    if (gen === browseLoadGen) setRegroupBusy(false);
+  }
 }
 
 async function loadBrowsePhotos(groupBy, key) {
@@ -5258,24 +8601,57 @@ function syncEditPersonControls(ctx) {
   if (clearBtn) clearBtn.hidden = !ctx.labeled;
 }
 
+let editFileMetaList = [];
+let editFileMetaGen = 0;
+
+function renderEditFileMeta(list) {
+  editFileMetaList = Array.isArray(list) ? list.filter((m) => m && !m.error) : [];
+  const takenEl = $("#edit-prop-taken-at");
+  const dateDiff = editFileMetaList.some(dateFileMetaDiffers);
+  if (takenEl) takenEl.classList.toggle("is-diff", dateDiff);
+}
+
+async function refreshEditFileMeta(photos) {
+  const gen = ++editFileMetaGen;
+  const ids = (photos || []).map((p) => p.id).filter((id) => id != null);
+  renderEditFileMeta([]);
+  if (!ids.length) return;
+  try {
+    const res = await api("/api/photos/file-meta", {
+      method: "POST",
+      body: JSON.stringify({ photo_ids: ids }),
+    });
+    if (gen !== editFileMetaGen) return;
+    renderEditFileMeta(res.photos || []);
+  } catch {
+    if (gen !== editFileMetaGen) return;
+    renderEditFileMeta([]);
+  }
+}
+
 function openEditPropertiesModal() {
-  const photos = (isDupesWorkspace() ? selectedDupePhotos() : selectedBrowsePhotos()).filter(
-    (p) => p.id != null
-  );
+  const photos = selectedPhotosForProperties();
   if (!photos.length) return;
   const dlg = $("#edit-properties");
   const form = $("#edit-properties-form");
   const err = $("#edit-properties-error");
   const count = $("#edit-properties-count");
+  const title = $("#edit-properties-title");
   err.hidden = true;
   err.textContent = "";
-  count.textContent = `${photos.length} photo${photos.length === 1 ? "" : "s"} selected`;
+  const n = photos.length;
+  if (title) title.textContent = n === 1 ? "Edit 1 photo" : `Edit ${n} photos`;
+  if (count) count.textContent = n === 1 ? "Editing 1 photo" : `Editing ${n} photos`;
   const dates = [...new Set(photos.map((p) => takenAtToInputValue(p.taken_at)).filter(Boolean))];
   form.elements.namedItem("taken_at").value = dates.length === 1 ? dates[0] : "";
   const places = [...new Set(photos.map((p) => (p.place_label || "").trim()).filter(Boolean))];
   form.elements.namedItem("place_label").value = places.length === 1 ? places[0] : "";
+  const writeEl = $("#edit-write-exif");
+  if (writeEl) writeEl.checked = writeDateToExif;
   syncEditPersonControls(peopleSelectionEditContext());
+  renderEditFileMeta([]);
   dlg.showModal();
+  refreshEditFileMeta(photos);
 }
 
 async function reloadAfterPeopleFaceEdit(personIds = []) {
@@ -5291,8 +8667,7 @@ async function reloadAfterPeopleFaceEdit(personIds = []) {
       console.error("recluster failed", err);
     }
   }
-  const peopleRoot = peopleBranchContainer();
-  if (peopleRoot?.dataset.loaded === "1") await fillPeopleBranch(peopleRoot);
+  await refreshPeopleBranchIfLoaded();
   await reloadBrowseGallery();
   refreshStats();
 }
@@ -5356,11 +8731,7 @@ async function applySelectedFacesName(name, { merge = false, unknown = false } =
 }
 
 function browseGroupBy() {
-  return browseView === "folders"
-    ? "folder"
-    : browseView === "people"
-      ? "person"
-      : browseView;
+  return browseGroupByForBranch(browseView);
 }
 
 async function reloadBrowseGallery() {
@@ -5378,7 +8749,7 @@ async function reloadBrowseGallery() {
     browseSearchActive = false;
     const results = $("#browse-results");
     if (results) {
-      results.innerHTML = `<p class="muted">Turn on “Show nested” to include nested items.</p>`;
+      results.innerHTML = `<p class="muted">Turn on “Show labeled images” to include nested items.</p>`;
     }
     updateBrowseSelectionCount();
     refreshScopedWorkspaceViews();
@@ -5398,6 +8769,12 @@ function locationKeysForResolvedPlace(place) {
   const venue = (place.venue || "").trim();
   const label = (place.place_label || "").trim();
   const keys = [];
+  if (label) {
+    const parts = label.split(",").map((s) => s.trim()).filter(Boolean);
+    for (let i = 0; i < parts.length; i++) {
+      keys.push(`place-suffix::${parts.slice(i).join(", ")}`);
+    }
+  }
   const parent = city || region;
   if (venue && country && parent) keys.push(`venue::${country}::${parent}::${venue}`);
   if (parent && country) keys.push(`city::${country}::${parent}`);
@@ -5410,7 +8787,7 @@ function locationKeysForResolvedPlace(place) {
 async function selectionAfterPlaceEdit(saved, resolvedPlace) {
   const next = cloneBrowseSelection(saved);
   const hadLocation =
-    Object.prototype.hasOwnProperty.call(next, "location") || browseView === "location";
+    Object.prototype.hasOwnProperty.call(next, "location") || browseView === "places";
   if (!resolvedPlace || !hadLocation) return next;
   const keys = locationKeysForResolvedPlace(resolvedPlace);
   if (!keys.length) return next;
@@ -5435,34 +8812,38 @@ async function reloadBrowseAfterPropertyEdit(props, resolvedPlace = null) {
     (Object.prototype.hasOwnProperty.call(browseSelectionByGroup, "date") && dateEdited) ||
     (Object.prototype.hasOwnProperty.call(browseSelectionByGroup, "location") &&
       placeEdited) ||
-    (browseView === "date" && dateEdited) ||
-    (browseView === "location" && placeEdited);
+    (browseView === "dates" && dateEdited) ||
+    (browseView === "places" && placeEdited);
   if (!treeAffecting) {
     await reloadBrowseGallery();
     // Places/Dates trees are lazy-cached; refresh or invalidate after edits
     // even when browsing Folders (or another view).
     const ids = [];
-    if (dateEdited) ids.push("date");
-    if (placeEdited) ids.push("location");
+    if (dateEdited) ids.push("dates");
+    if (placeEdited) ids.push("places");
+    if (dateEdited || placeEdited) ids.push("collections");
     if (ids.length) await refreshExpandedBranches(ids);
     photoMapLoaded = false;
     photoMapBounds = null;
     return;
   }
   const saved = cloneBrowseSelection();
+  const openKeys = collectOpenBrowseKeys($("#browse-groups"));
   await loadBrowseView({ skipRestore: true });
   const target =
     placeEdited && placeEditNav === "follow"
       ? await selectionAfterPlaceEdit(saved, resolvedPlace)
       : saved;
   if (!browseSelectionParticipates(target)) {
+    await restoreBrowseTreeExpansion(openKeys);
     refreshScopedWorkspaceViews();
     return;
   }
-  const surviving = await restoreBrowseTreeSelection(target);
+  const surviving = await restoreBrowseTreeSelection(target, openKeys);
   const hasKeys = Object.values(surviving).some((k) => k?.length);
   if (!hasKeys) {
     browseSelectionByGroup = {};
+    saveBrowseSelectionPref();
     browseActiveKey = null;
     browseActiveKeys = [];
     browseItems = [];
@@ -5473,9 +8854,11 @@ async function reloadBrowseAfterPropertyEdit(props, resolvedPlace = null) {
     const results = $("#browse-results");
     if (results) results.innerHTML = `<p class="muted">This group no longer has photos.</p>`;
     updateBrowseSelectionCount();
+    await restoreBrowseTreeExpansion(openKeys);
     refreshScopedWorkspaceViews();
     return;
   }
+  await restoreBrowseTreeExpansion(openKeys);
   await loadBrowsePhotosFromSelection(surviving);
   photoMapLoaded = false;
   photoMapBounds = null;
@@ -5505,19 +8888,26 @@ async function openAddToFolderModal(photoIds) {
   if (count) {
     count.textContent = `${ids.length} photo${ids.length === 1 ? "" : "s"} selected`;
   }
+  const nestedWrap = $("#add-to-folder-nested-wrap");
+  const nested = $("#add-to-folder-nested");
+  const parentId = activeCollectionId();
+  const parentLinked = activeCollectionFlags().linked;
+  if (nestedWrap) nestedWrap.hidden = parentId == null || parentLinked;
+  if (nested) nested.checked = parentId != null && !parentLinked;
   if (select) {
     select.innerHTML = `<option value="">Choose…</option>`;
     try {
-      const folders = await api(`/api/virtual-folders${removeQuery() ? `?${removeQuery().slice(1)}` : ""}`);
-      for (const f of folders || []) {
+      const folders = await api(`/api/collections${removeQuery() ? `?${removeQuery().slice(1)}` : ""}`);
+      for (const f of flattenCollections(folders || [])) {
+        if (f.linked) continue;
         const opt = document.createElement("option");
         opt.value = String(f.id);
-        opt.textContent = `${f.name} (${f.count ?? 0})`;
+        opt.textContent = `${f.pathLabel} (${f.count ?? 0})`;
         select.appendChild(opt);
       }
     } catch (ex) {
       if (err) {
-        err.textContent = ex.message || "Failed to load folders";
+        err.textContent = ex.message || "Failed to load collections";
         err.hidden = false;
       }
     }
@@ -5535,21 +8925,21 @@ $("#btn-browse-add-folder")?.addEventListener("click", () => {
 });
 
 $("#btn-browse-remove-folder")?.addEventListener("click", async () => {
-  const folderId = activeVirtualFolderId();
+  const folderId = activeCollectionId();
   if (folderId == null) return;
   const ids = selectedBrowsePhotos()
     .filter((p) => p.id != null)
     .map((p) => p.id);
   if (!ids.length) return;
   try {
-    await api(`/api/virtual-folders/${folderId}/members`, {
+    await api(`/api/collections/${folderId}/members`, {
       method: "DELETE",
       body: JSON.stringify({ photo_ids: ids }),
     });
     browseSelected.clear();
     browseAnchorKey = null;
     await reloadBrowseGallery();
-    await refreshExpandedBranches(["folders"]);
+    await refreshExpandedBranches(["collections"]);
   } catch (ex) {
     alert(ex.message || "Remove from folder failed");
   }
@@ -5574,21 +8964,27 @@ $("#add-to-folder-form")?.addEventListener("submit", async (e) => {
   if (saveBtn) saveBtn.disabled = true;
   try {
     if (newName) {
-      const created = await api("/api/virtual-folders", {
+      const created = await api("/api/collections", {
         method: "POST",
-        body: JSON.stringify({ name: newName }),
+        body: JSON.stringify({
+          name: newName,
+          parent_id:
+            $("#add-to-folder-nested")?.checked && activeCollectionId() != null
+              ? activeCollectionId()
+              : null,
+        }),
       });
       folderId = created.id;
     }
     if (!folderId) {
       throw new Error("Choose an existing folder or enter a new name");
     }
-    await api(`/api/virtual-folders/${folderId}/members`, {
+    await api(`/api/collections/${folderId}/members`, {
       method: "POST",
       body: JSON.stringify({ photo_ids: addToFolderPhotoIds }),
     });
     $("#add-to-folder")?.close();
-    await refreshExpandedBranches(["folders"]);
+    await refreshExpandedBranches(["collections"]);
   } catch (ex) {
     let msg = ex.message || "Add failed";
     if (msg.includes("name_conflict") || /already exists/i.test(msg)) {
@@ -5643,9 +9039,7 @@ $("#btn-edit-properties-cancel")?.addEventListener("click", () => {
 $("#edit-properties-form")?.addEventListener("submit", async (e) => {
   e.preventDefault();
   const form = e.currentTarget;
-  const ids = (isDupesWorkspace() ? selectedDupePhotos() : selectedBrowsePhotos())
-    .filter((p) => p.id != null)
-    .map((p) => p.id);
+  const ids = selectedPhotosForProperties().map((p) => p.id);
   if (!ids.length) return;
   const props = collectEditProperties(form);
   const err = $("#edit-properties-error");
@@ -5676,10 +9070,18 @@ $("#edit-properties-form")?.addEventListener("submit", async (e) => {
   }
   saveBtn.disabled = true;
   err.hidden = true;
+  const writeExif = !!$("#edit-write-exif")?.checked;
+  if (writeExif !== writeDateToExif) {
+    writeDateToExif = writeExif;
+    api("/api/settings", {
+      method: "POST",
+      body: JSON.stringify({ write_date_to_exif: writeExif }),
+    }).catch(() => {});
+  }
   try {
     const res = await api("/api/photos/properties", {
       method: "POST",
-      body: JSON.stringify({ photo_ids: ids, properties: props }),
+      body: JSON.stringify({ photo_ids: ids, properties: props, write_exif: writeExif }),
     });
     if (res.errors?.length) {
       const n = res.errors.length;
@@ -5709,7 +9111,80 @@ $("#edit-properties-form")?.addEventListener("submit", async (e) => {
   }
 });
 
+$("#btn-browse-export")?.addEventListener("click", async () => {
+  const ids = (isDupesWorkspace() ? selectedDupePhotos() : selectedBrowsePhotos())
+    .filter((p) => p.id != null)
+    .map((p) => p.id);
+  if (!ids.length) return;
+  const exportBtn = $("#btn-browse-export");
+  const countEl = $("#browse-gallery-count");
+  const prevLabel = exportBtn?.textContent || "Export selected";
+  const prevCount = countEl?.textContent || "";
+  if (exportBtn) {
+    exportBtn.disabled = true;
+    exportBtn.textContent = "Choosing folder…";
+  }
+  try {
+    const picked = await api(
+      `/api/pick-directory?title=${encodeURIComponent("Export photos to")}`,
+      { method: "POST" }
+    );
+    if (picked.cancelled || !picked.path) return;
+    if (exportBtn) exportBtn.textContent = "Exporting…";
+    if (countEl) countEl.textContent = `Exporting ${ids.length}…`;
+    const res = await api("/api/photos/export", {
+      method: "POST",
+      body: JSON.stringify({ photo_ids: ids, dest: picked.path }),
+    });
+    const parts = [`Exported ${res.exported || 0}`];
+    if (res.skipped) parts.push(`${res.skipped} missing`);
+    if (res.failed) parts.push(`${res.failed} failed`);
+    if (countEl) countEl.textContent = `${parts.join("; ")} → ${res.dest || picked.path}`;
+  } catch (ex) {
+    alert(ex.message || "Export failed");
+    if (countEl) countEl.textContent = prevCount;
+  } finally {
+    if (exportBtn) {
+      exportBtn.textContent = prevLabel;
+      if (isDupesWorkspace()) syncDupeToolbar();
+      else syncBrowseRemoveButtons();
+    }
+  }
+});
+
 $("#btn-browse-remove")?.addEventListener("click", async () => {
+  const removeBtn = $("#btn-browse-remove");
+  const restoreMode = removeBtn?.dataset.mode === "restore";
+  if (restoreMode) {
+    if (isDupesWorkspace()) {
+      const ids = selectedDupePhotos()
+        .filter((p) => p.id != null && p.culled)
+        .map((p) => p.id);
+      if (!ids.length) return;
+      await restorePhotoIds(ids);
+      ids.forEach((id) => patchLocalPhotoCulled(id, false));
+      dupeSelected.clear();
+      loadDupes();
+      refreshStats();
+      return;
+    }
+    const ids = selectedBrowsePhotos()
+      .filter((p) => p.id != null && p.culled)
+      .map((p) => p.id);
+    if (!ids.length) return;
+    await restorePhotoIds(ids);
+    ids.forEach((id) => patchLocalPhotoCulled(id, false));
+    browseSelected.clear();
+    browseAnchorKey = null;
+    refreshStats();
+    if (photoVisibility === "all") {
+      renderBrowseResults();
+      refreshScopedWorkspaceViews();
+    } else {
+      await reloadBrowseGallery();
+    }
+    return;
+  }
   if (isDupesWorkspace()) {
     const ids = selectedDupePhotos()
       .filter((p) => p.id != null && !p.culled)
@@ -5722,58 +9197,43 @@ $("#btn-browse-remove")?.addEventListener("click", async () => {
         if (el.dataset.culled === "1") return true;
         return dupeSelected.has(Number(el.dataset.id));
       });
-    if (removingAll && !confirm(`Remove all ${n} photo${n === 1 ? "" : "s"}?`)) return;
+    if (removingAll && !confirm(`Reject all ${n} photo${n === 1 ? "" : "s"}?`)) return;
     await removePhotoIds(ids);
+    ids.forEach((id) => patchLocalPhotoCulled(id, true));
     dupeSelected.clear();
     loadDupes();
     refreshStats();
     return;
   }
-  const ids = selectedBrowsePhotos()
+  const selectedIds = selectedBrowsePhotos()
     .filter((p) => p.id != null && !p.culled)
     .map((p) => p.id);
-  if (!ids.length) return;
-  const n = ids.length;
+  if (!selectedIds.length) return;
+  const n = selectedIds.length;
   const removableVisible = browseDisplayItems().filter((p) => p.id != null && !p.culled);
   const removingAll =
     removableVisible.length > 0 &&
     removableVisible.every((p) => browseSelected.has(browseItemKey(p)));
-  if (removingAll && !confirm(`Remove all ${n} photo${n === 1 ? "" : "s"}?`)) return;
+  if (removingAll && !confirm(`Reject all ${n} photo${n === 1 ? "" : "s"}?`)) return;
+  const ids = expandRemoveIdsForHiddenReplicas(selectedIds);
   await removePhotoIds(ids);
+  ids.forEach((id) => patchLocalPhotoCulled(id, true));
   browseSelected.clear();
   browseAnchorKey = null;
   refreshStats();
-  await reloadBrowseGallery();
-});
-
-$("#btn-browse-restore")?.addEventListener("click", async () => {
-  if (isDupesWorkspace()) {
-    const ids = selectedDupePhotos()
-      .filter((p) => p.id != null && p.culled)
-      .map((p) => p.id);
-    if (!ids.length) return;
-    await restorePhotoIds(ids);
-    dupeSelected.clear();
-    loadDupes();
-    refreshStats();
-    return;
+  if (photoVisibility === "all") {
+    renderBrowseResults();
+    refreshScopedWorkspaceViews();
+  } else {
+    await reloadBrowseGallery();
   }
-  const ids = selectedBrowsePhotos()
-    .filter((p) => p.id != null && p.culled)
-    .map((p) => p.id);
-  if (!ids.length) return;
-  await restorePhotoIds(ids);
-  browseSelected.clear();
-  browseAnchorKey = null;
-  refreshStats();
-  await reloadBrowseGallery();
 });
 
 $("#btn-browse-delete")?.addEventListener("click", async () => {
   const selected = isDupesWorkspace() ? selectedDupePhotos() : selectedBrowsePhotos();
-  const ids = selected.filter((p) => p.id != null && p.culled).map((p) => p.id);
-  if (!ids.length) return;
-  const n = ids.length;
+  const selectedIds = selected.filter((p) => p.id != null && p.culled).map((p) => p.id);
+  if (!selectedIds.length) return;
+  const n = selectedIds.length;
   if (
     !confirm(
       `Delete ${n} selected file${n === 1 ? "" : "s"}?\n\nFiles are moved to the system trash (not permanently erased). They will be removed from the index.`
@@ -5781,38 +9241,89 @@ $("#btn-browse-delete")?.addEventListener("click", async () => {
   ) {
     return;
   }
-  const res = await deletePhotoIds(ids);
-  if (res?.failed) {
-    alert(
-      `Deleted ${res.deleted || 0} from the index. ${res.failed} file${res.failed === 1 ? "" : "s"} could not be moved to trash (kept in Removed).`
-    );
+  const ids = expandDeleteIdsForHiddenReplicas(selectedIds);
+  const deleteBtn = $("#btn-browse-delete");
+  if (deleteBtn) {
+    deleteBtn.disabled = true;
+    deleteBtn.setAttribute("aria-busy", "true");
   }
-  if (isDupesWorkspace()) {
+  const countEl = $("#browse-gallery-count");
+  const prevCount = countEl?.textContent || "";
+  if (countEl) countEl.textContent = `Deleting ${ids.length}…`;
+  try {
+    const res = await deletePhotoIds(ids);
+    const deletedIds = res?.deleted_ids?.length ? res.deleted_ids : ids;
+    const failed = res?.failed || 0;
+    const deleted = res?.deleted || deletedIds.length;
+    dropLocalPhotosById(deletedIds);
+    browseSelected.clear();
+    browseAnchorKey = null;
     dupeSelected.clear();
-    loadDupes();
+    if (isDupesWorkspace()) {
+      const gone = new Set(deletedIds);
+      lastClusterPreviewItems = (lastClusterPreviewItems || [])
+        .map((g) => ({
+          ...g,
+          members: (g.members || []).filter((m) => !gone.has(m.id)),
+        }))
+        .filter((g) => (g.members || []).length);
+      renderDupeGroups(lastClusterPreviewItems);
+    } else if (typeof renderBrowseResults === "function") {
+      renderBrowseResults();
+    }
+    updateBrowseSelectionCount();
+    if (countEl) {
+      countEl.textContent =
+        failed > 0
+          ? `Deleted ${deleted}; ${failed} failed`
+          : `Deleted ${deleted}`;
+    }
+    if (failed) {
+      alert(
+        `Deleted ${deleted} from the index. ${failed} file${failed === 1 ? "" : "s"} could not be moved to trash (kept in Rejected).`
+      );
+    }
     refreshStats();
-    return;
+    if (isDupesWorkspace()) {
+      await loadDupes();
+    } else {
+      await reloadBrowseGallery();
+    }
+  } catch (ex) {
+    alert(ex.message || "Delete failed");
+    if (countEl) countEl.textContent = prevCount;
+  } finally {
+    if (deleteBtn) {
+      deleteBtn.removeAttribute("aria-busy");
+      syncBrowseRemoveButtons();
+      syncDupeToolbar();
+    }
   }
-  browseSelected.clear();
-  browseAnchorKey = null;
-  refreshStats();
-  await reloadBrowseGallery();
 });
 
-async function ensureBrowseBranchLoaded(groupBy) {
+async function ensureBrowseBranchLoaded(groupBy, openKeys = null) {
   const branchId = browseViewForGroupBy(groupBy);
   const root = $("#browse-groups")?.querySelector(
     `.browse-branch[data-branch="${CSS.escape(branchId)}"]`
   );
   if (!root) return null;
-  if (root.dataset.loaded !== "1") await toggleBrowseBranch(root, true);
+  if (root.dataset.loaded !== "1") await toggleBrowseBranch(root, true, openKeys);
   else {
     const sub = root.nextElementSibling;
     if (sub?.classList.contains("browse-subtree") && sub.hidden) {
-      await toggleBrowseBranch(root, true);
+      await toggleBrowseBranch(root, true, openKeys);
     }
   }
   return root;
+}
+
+async function restoreBrowseTreeExpansion(openKeys) {
+  if (!openKeys?.size) return;
+  for (const key of openKeys) {
+    if (!key.startsWith("branch:")) continue;
+    const id = key.slice("branch:".length);
+    await ensureBrowseBranchLoaded(browseGroupByForBranch(id), openKeys);
+  }
 }
 
 function revealBrowseTreeAncestors(item) {
@@ -5849,7 +9360,7 @@ function restoreBrowseTreeKeys(keys) {
 }
 
 /** Restore multi-branch selection; returns surviving selectionByGroup. */
-async function restoreBrowseTreeSelection(selectionByGroup) {
+async function restoreBrowseTreeSelection(selectionByGroup, openKeys = null) {
   const sidebar = $("#browse-groups");
   const surviving = {};
   if (!sidebar) return surviving;
@@ -5862,7 +9373,7 @@ async function restoreBrowseTreeSelection(selectionByGroup) {
       continue;
     }
     if (keys.length === 1 && keys[0] === "all") {
-      const root = await ensureBrowseBranchLoaded(groupBy);
+      const root = await ensureBrowseBranchLoaded(groupBy, openKeys);
       if (root) {
         root.classList.add("selected");
         selectedEls.push(root);
@@ -5870,7 +9381,7 @@ async function restoreBrowseTreeSelection(selectionByGroup) {
       }
       continue;
     }
-    await ensureBrowseBranchLoaded(groupBy);
+    await ensureBrowseBranchLoaded(groupBy, openKeys);
     const kept = [];
     for (const k of keys) {
       const item = sidebar.querySelector(
@@ -5889,13 +9400,19 @@ async function restoreBrowseTreeSelection(selectionByGroup) {
 }
 
 $("#browse-show-nested")?.addEventListener("click", async () => {
-  // Folders/dates/places: nested gallery scope. People: labeled filter.
+  // Archives/collections/dates: nested gallery scope. People/Places: labeled filter.
   const saved = cloneBrowseSelection();
   const hadPerson = Array.isArray(saved.person);
-  const peopleRoot = $("#browse-groups")?.querySelector('.browse-branch[data-branch="people"]');
-  if (peopleRoot?.dataset.loaded === "1") await fillPeopleBranch();
-  if (hadPerson) {
+  const hadLocation = Array.isArray(saved.location);
+  const locationRoot = $("#browse-groups")?.querySelector('.browse-branch[data-branch="places"]');
+  await refreshPeopleBranchIfLoaded();
+  if (locationRoot?.dataset.loaded === "1") await fillPlacesBranch();
+  if (hadPerson || hadLocation) {
     const surviving = await restoreBrowseTreeSelection(saved);
+    if (hadLocation && !surviving.location?.length && locationRoot) {
+      locationRoot.classList.add("selected");
+      surviving.location = ["all"];
+    }
     if (Object.values(surviving).some((k) => k?.length)) {
       await loadBrowsePhotosFromSelection(surviving);
     } else {
@@ -5904,8 +9421,11 @@ $("#browse-show-nested")?.addEventListener("click", async () => {
     refreshScopedWorkspaceViews();
     return;
   }
+  // Selection keys are often unchanged; clear so activate reloads with the new
+  // include_subfolders (Library / Collections / Dates).
   const selected = [...($("#browse-groups")?.querySelectorAll(".browse-item.selected") || [])];
   if (selected.length) {
+    browseSelectionByGroup = {};
     await activateSelectedBrowseTree(selected[0]);
     return;
   }
@@ -5913,6 +9433,7 @@ $("#browse-show-nested")?.addEventListener("click", async () => {
 });
 
 async function applyPhotoVisibility(mode) {
+  if (mode === "selected") mode = "active";
   if (!VALID_PHOTO_VISIBILITY.has(mode) || mode === photoVisibility) return;
   photoVisibility = mode;
   syncPhotoVisibilityButtons();
@@ -5941,7 +9462,7 @@ async function applyPhotoVisibility(mode) {
   refreshScopedWorkspaceViews();
 }
 
-document.querySelectorAll(".visibility-btn").forEach((btn) => {
+document.querySelectorAll(".visibility-modes [data-visibility]").forEach((btn) => {
   btn.addEventListener("click", () => {
     applyPhotoVisibility(btn.dataset.visibility);
   });
@@ -5951,15 +9472,13 @@ $("#browse-show-face")?.addEventListener("click", () => {
   syncBrowseFrameVisibility();
 });
 
-$("#browse-show-months")?.addEventListener("click", () => {
-  if (GALLERY_WORKSPACE_VIEWS.has(browseGalleryView)) renderBrowseResults();
-});
-
 $("#lightbox-show-frames")?.addEventListener("click", () => {
   drawLightboxFaceBoxes();
 });
 
-$("#lightbox-orientation")?.addEventListener("change", () => {
+$("#lightbox-rotate")?.addEventListener("click", () => {
+  const next = (orientationDeg($("#lightbox-orientation")?.value) + 90) % 360;
+  setLightboxOrientationControl(next);
   applyLightboxEditPreview();
   syncLightboxLayoutMode();
   requestAnimationFrame(() => drawLightboxFaceBoxes());
@@ -5973,10 +9492,12 @@ $("#lightbox-mirror")?.addEventListener("click", () => {
   saveLightboxEdits({ showErrors: true });
 });
 
-$("#lightbox-place")?.addEventListener("change", () => {
+function commitLightboxPlaceEdit() {
   if (placeSuggestPending) return;
   saveLightboxEdits({ showErrors: true });
-});
+}
+$("#lightbox-place")?.addEventListener("change", commitLightboxPlaceEdit);
+$("#lightbox-place")?.addEventListener("blur", commitLightboxPlaceEdit);
 $("#lightbox-taken-at")?.addEventListener("change", () => {
   saveLightboxEdits({ showErrors: true });
 });
@@ -5988,6 +9509,7 @@ $("#lightbox-place")?.addEventListener("keydown", (e) => {
       return;
     }
     e.target.blur();
+    commitLightboxPlaceEdit();
   } else if (e.key === "Escape" && placeSuggestPending) {
     e.preventDefault();
     e.stopPropagation();
@@ -5995,11 +9517,22 @@ $("#lightbox-place")?.addEventListener("keydown", (e) => {
   }
 });
 
+$("#lightbox-meta")?.addEventListener("click", (e) => {
+  if (e.target.closest(".lightbox-coords-map")) showLightboxPhotoOnMap();
+  if (e.target.closest(".lightbox-coords-refresh")) reloadLightboxExifCoords();
+});
+$("#lightbox-write-exif")?.addEventListener("click", () => {
+  writeLightboxExif();
+});
+
 $("#lightbox-remove")?.addEventListener("click", () => {
   removeLightboxPhoto();
 });
 $("#lightbox-restore")?.addEventListener("click", () => {
   restoreLightboxPhoto();
+});
+$("#lightbox-delete")?.addEventListener("click", () => {
+  deleteLightboxPhoto();
 });
 $("#lightbox-similar")?.addEventListener("click", async () => {
   const photo = lightboxCurrentPhoto();
@@ -6024,7 +9557,7 @@ $("#lightbox-similar")?.addEventListener("click", async () => {
 });
 
 $("#btn-browse-similar")?.addEventListener("click", async () => {
-  const selected = selectedBrowsePhotos();
+  const selected = isDupesWorkspace() ? selectedDupePhotos() : selectedBrowsePhotos();
   if (selected.length !== 1) return;
   const btn = $("#btn-browse-similar");
   if (btn) btn.disabled = true;
@@ -6042,19 +9575,17 @@ document.querySelectorAll(".lightbox-vqa-preset").forEach((btn) => {
     const task = btn.dataset.vqaTask || "freeform";
     setLightboxVqaTask(task);
     if (task === "freeform") {
-      $("#lightbox-vqa-prompt")?.focus();
+      const prompt = ($("#lightbox-vqa-prompt")?.value || "").trim();
+      if (prompt) runLightboxVqa("freeform");
+      else $("#lightbox-vqa-prompt")?.focus();
       return;
     }
     runLightboxVqa(task);
   });
 });
 
-$("#lightbox-vqa-ask")?.addEventListener("click", () => {
-  runLightboxVqa("freeform");
-});
-
 $("#lightbox-vqa-prompt")?.addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+  if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
     runLightboxVqa("freeform");
   }
@@ -6062,10 +9593,22 @@ $("#lightbox-vqa-prompt")?.addEventListener("keydown", (e) => {
 
 $("#lightbox-prev")?.addEventListener("click", () => lightboxNavigateTo(lightboxIndex - 1));
 $("#lightbox-next")?.addEventListener("click", () => lightboxNavigateTo(lightboxIndex + 1));
+$("#lightbox-up")?.addEventListener("click", () => lightboxNavigateCluster(-1));
+$("#lightbox-down")?.addEventListener("click", () => lightboxNavigateCluster(1));
+$("#lightbox-fullscreen")?.addEventListener("click", () => {
+  const dlg = $("#lightbox");
+  setLightboxFullscreen(!dlg?.classList.contains("is-fullscreen"));
+});
 $("#lightbox")?.addEventListener("cancel", (e) => {
   if (placeSuggestPending) {
     e.preventDefault();
     cancelPlaceSuggestion();
+    return;
+  }
+  const dlg = $("#lightbox");
+  if (dlg?.classList.contains("is-fullscreen")) {
+    e.preventDefault();
+    setLightboxFullscreen(false);
   }
 });
 $("#lightbox")?.addEventListener("keydown", (e) => {
@@ -6073,23 +9616,137 @@ $("#lightbox")?.addEventListener("keydown", (e) => {
   if (tag === "input" || tag === "textarea" || tag === "select") return;
   if (e.key === "ArrowLeft") { e.preventDefault(); lightboxNavigateTo(lightboxIndex - 1); }
   else if (e.key === "ArrowRight") { e.preventDefault(); lightboxNavigateTo(lightboxIndex + 1); }
+  else if (e.key === "ArrowUp") { e.preventDefault(); lightboxNavigateCluster(-1); }
+  else if (e.key === "ArrowDown") { e.preventDefault(); lightboxNavigateCluster(1); }
 });
 
 $("#lightbox")?.addEventListener("close", () => {
+  document.querySelector(".lightbox-stage-wrap")?.classList.remove("is-over-image");
   cancelPlaceSuggestion();
   saveLightboxEdits();
   flushLightboxRecluster();
+  resetLightboxZoomPan();
 });
+
+(() => {
+  const wrap = document.querySelector(".lightbox-stage-wrap");
+  const stage = $("#lightbox-img")?.closest(".lightbox-stage");
+  const nav = wrap?.querySelector(".lightbox-nav-bar");
+  if (!wrap || !stage || !nav) return;
+  const setOver = (on) => wrap.classList.toggle("is-over-image", on);
+  stage.addEventListener("mouseenter", () => setOver(true));
+  stage.addEventListener("mouseleave", (e) => {
+    if (nav.contains(e.relatedTarget)) return;
+    setOver(false);
+  });
+  nav.addEventListener("mouseout", (e) => {
+    if (nav.contains(e.relatedTarget) || stage.contains(e.relatedTarget)) return;
+    setOver(false);
+  });
+})();
+
+$("#btn-map-pin-cancel")?.addEventListener("click", () => settleMapPinConfirm(false));
+$("#btn-map-pin-no")?.addEventListener("click", () => settleMapPinConfirm(false));
+$("#map-pin-confirm")?.addEventListener("cancel", (e) => {
+  e.preventDefault();
+  settleMapPinConfirm(false);
+});
+$("#map-pin-confirm-form")?.addEventListener("submit", (e) => {
+  e.preventDefault();
+  settleMapPinConfirm(true);
+});
+
+(() => {
+  const stage = $("#lightbox-img")?.closest(".lightbox-stage");
+  if (!stage) return;
+
+  stage.addEventListener(
+    "wheel",
+    (e) => {
+      if (!$("#lightbox")?.open) return;
+      e.preventDefault();
+      const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+      lightboxZoomAt(e.clientX, e.clientY, lightboxZoom * factor);
+    },
+    { passive: false }
+  );
+
+  stage.addEventListener("mousedown", (e) => {
+    if (e.button !== 0) return;
+    if (e.target.closest(".lightbox-nav")) return;
+    if (lightboxZoom <= 1.001) return;
+    e.preventDefault();
+    lightboxPanDrag = {
+      x: e.clientX,
+      y: e.clientY,
+      panX: lightboxPanX,
+      panY: lightboxPanY,
+    };
+    applyLightboxZoomPan();
+  });
+
+  window.addEventListener("mousemove", (e) => {
+    if (!lightboxPanDrag) return;
+    lightboxPanX = lightboxPanDrag.panX + (e.clientX - lightboxPanDrag.x);
+    lightboxPanY = lightboxPanDrag.panY + (e.clientY - lightboxPanDrag.y);
+    applyLightboxZoomPan();
+  });
+
+  window.addEventListener("mouseup", () => {
+    if (!lightboxPanDrag) return;
+    lightboxPanDrag = null;
+    applyLightboxZoomPan();
+  });
+
+  const nav = document.querySelector(".lightbox-zoom-nav");
+  if (nav) {
+    let navDragging = false;
+    const jumpToEvent = (e) => {
+      const n = lightboxZoomNavNormFromEvent(e, nav);
+      if (!n) return;
+      lightboxPanToNorm(n.x, n.y);
+    };
+    nav.addEventListener("mousedown", (e) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      navDragging = true;
+      jumpToEvent(e);
+    });
+    window.addEventListener("mousemove", (e) => {
+      if (!navDragging) return;
+      jumpToEvent(e);
+    });
+    window.addEventListener("mouseup", () => {
+      navDragging = false;
+    });
+  }
+})();
 
 /* Draggable & resizable dialogs with localStorage persistence */
 function initDraggableDialog(dialog) {
   const key = "dlg-" + dialog.id;
   const handle = dialog.querySelector(".dialog-head");
   if (!handle) return;
+  let restoring = false;
+
+  function applyBox(x, y, w, h, clamp = true) {
+    dialog.style.margin = "0";
+    dialog.style.position = "fixed";
+    dialog.style.inset = "auto";
+    const left = clamp ? Math.max(0, Math.min(x, innerWidth - 80)) : x;
+    const top = clamp ? Math.max(0, Math.min(y, innerHeight - 60)) : y;
+    dialog.style.left = left + "px";
+    dialog.style.top = top + "px";
+    if (w) dialog.style.width = w + "px";
+    if (h) dialog.style.height = h + "px";
+  }
 
   function save() {
+    if (restoring || !dialog.open) return;
     try {
       const r = dialog.getBoundingClientRect();
+      if (r.width < 40 || r.height < 40) return;
       localStorage.setItem(key, JSON.stringify({
         x: Math.round(r.left), y: Math.round(r.top),
         w: Math.round(r.width), h: Math.round(r.height),
@@ -6100,14 +9757,16 @@ function initDraggableDialog(dialog) {
   function restore() {
     try {
       const s = JSON.parse(localStorage.getItem(key));
-      if (!s) return;
-      dialog.style.margin = "0";
-      dialog.style.position = "fixed";
-      dialog.style.left = Math.max(0, Math.min(s.x, innerWidth - 80)) + "px";
-      dialog.style.top = Math.max(0, Math.min(s.y, innerHeight - 60)) + "px";
-      if (s.w) dialog.style.width = s.w + "px";
-      if (s.h) dialog.style.height = s.h + "px";
-    } catch (_) {}
+      if (!s || !Number.isFinite(s.x) || !Number.isFinite(s.y)) return;
+      restoring = true;
+      applyBox(s.x, s.y, s.w, s.h);
+      requestAnimationFrame(() => {
+        applyBox(s.x, s.y, s.w, s.h);
+        restoring = false;
+      });
+    } catch (_) {
+      restoring = false;
+    }
   }
 
   handle.addEventListener("mousedown", (e) => {
@@ -6117,10 +9776,7 @@ function initDraggableDialog(dialog) {
     const sx = e.clientX, sy = e.clientY;
     const sl = rect.left, st = rect.top;
     const onMove = (ev) => {
-      dialog.style.margin = "0";
-      dialog.style.position = "fixed";
-      dialog.style.left = (sl + ev.clientX - sx) + "px";
-      dialog.style.top = (st + ev.clientY - sy) + "px";
+      applyBox(sl + ev.clientX - sx, st + ev.clientY - sy, null, null, false);
     };
     const onUp = () => {
       document.removeEventListener("mousemove", onMove);
@@ -6131,8 +9787,7 @@ function initDraggableDialog(dialog) {
     document.addEventListener("mouseup", onUp);
   });
 
-  new ResizeObserver(() => { if (dialog.open) save(); }).observe(dialog);
-  dialog.addEventListener("close", save);
+  new ResizeObserver(() => { if (dialog.open && !restoring) save(); }).observe(dialog);
 
   const origShow = dialog.showModal.bind(dialog);
   dialog.showModal = function () { origShow(); restore(); };
@@ -6144,19 +9799,28 @@ loadBrowsePrefs();
 bindPressPrefs();
 bindLayoutSplitters();
 bindBrowseTimeline();
+setLightboxFullscreen(lightboxFullscreenPref(), { persist: false });
 loadBrowseView();
 loadAppSettings();
 try {
   const saved = localStorage.getItem(TAB_STORAGE_KEY);
-  if (saved === "sources" || saved === "browse" || saved === "cards" || !saved) {
-    activateWorkspaceView(browseGalleryView || "thumbs");
+  if (restoreCompareView || saved === "compare" || saved === "dupes") {
+    activateWorkspaceView("compare");
+  } else if (saved === "thumbs" || saved === "stack") {
+    activateWorkspaceView("stack");
+  } else if (saved === "sources" || saved === "browse" || saved === "cards" || !saved) {
+    activateWorkspaceView(
+      browseGalleryView === "details" ? "details" : "stack"
+    );
   } else if (VALID_WORKSPACE_VIEWS.has(saved)) {
     activateWorkspaceView(saved);
   } else if (saved === "search") {
-    activateWorkspaceView(browseGalleryView || "thumbs");
+    activateWorkspaceView(
+      browseGalleryView === "details" ? "details" : "stack"
+    );
   } else {
-    activateWorkspaceView("thumbs");
+    activateWorkspaceView("stack");
   }
 } catch (_) {
-  activateWorkspaceView("thumbs");
+  activateWorkspaceView("stack");
 }

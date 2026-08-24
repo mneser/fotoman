@@ -77,7 +77,7 @@ def _set(**kwargs: Any) -> None:
 
 
 def count_pending_faces(source_id: int | None = None) -> int:
-    """Contents not yet face-scanned (faces_ready=0), optionally scoped to an archive."""
+    """Contents not yet facematched (faces_ready=0), optionally scoped to an archive."""
     with db() as conn:
         if source_id is None:
             row = conn.execute(
@@ -109,6 +109,7 @@ def sources_with_pending_faces() -> list[int]:
             SELECT s.id, s.path
             FROM sources s
             WHERE s.enabled = 1
+              AND IFNULL(s.kind, 'watched') != 'backup'
               AND EXISTS (
                 SELECT 1 FROM photos p
                 JOIN photo_contents c ON c.id = p.content_id
@@ -117,7 +118,9 @@ def sources_with_pending_faces() -> list[int]:
             ORDER BY s.id
             """
         ).fetchall()
-    return [int(r["id"]) for r in rows if Path(r["path"]).exists()]
+    from fotoman import device
+
+    return [int(r["id"]) for r in rows if device.source_exists(dict(r))]
 
 
 def repair_orphan_person_links() -> int:
@@ -133,7 +136,7 @@ def repair_orphaned_ready_flags() -> int:
     """One-shot: clear faces_ready left set after an interrupted wipe-rebuild.
 
     Old rebuilds deleted face rows then marked ready during detect before
-    clustering committed. Restart looked like face-scanned>0 with empty People.
+    clustering committed. Restart looked like facematched>0 with empty People.
     Safe only once — a finished library with zero faces is also faces=0+ready>0.
     """
     from fotoman.config import load_settings, save_settings
@@ -748,7 +751,7 @@ def start_rebuild_background(
     if source_id is None:
         ids = sources_with_pending_faces()
         if not ids:
-            _set(phase="done", message="All images already face-scanned", running=False)
+            _set(phase="done", message="All images already facematched", running=False)
             return get_status()
         start_rebuild_background(threshold=threshold, source_id=ids[0])
         for sid in ids[1:]:
@@ -966,7 +969,7 @@ def _rebuild_inner(
             total=0,
             people=n_people,
             faces=n_faces,
-            message="All images already face-scanned",
+            message="All images already facematched",
         )
         return {
             "people": n_people,
@@ -992,7 +995,9 @@ def _rebuild_inner(
 
         for i, item in enumerate(batch):
             _checkpoint_pause(resume_phase="detect")
-            path = Path(item["path"])
+            from fotoman import device
+
+            path = device.readable_path(item["path"]) or Path(item["path"])
             cid = int(item["content_id"])
             if path.exists():
                 for face in _detect_and_embed(path):
@@ -1368,6 +1373,43 @@ def set_face_name(
         return {**_person_dict(row), "face_id": face_id, "scope": "face"}
 
 
+def assign_face_to_person(face_id: int, person_id: int) -> dict[str, Any]:
+    """Move one face onto an existing person without renaming that person."""
+    keep_id = int(person_id)
+    with db() as conn:
+        face = conn.execute(
+            """
+            SELECT f.id, f.person_id, p.id AS person_row_id
+            FROM faces f
+            LEFT JOIN people p ON p.id = f.person_id
+            WHERE f.id = ?
+            """,
+            (face_id,),
+        ).fetchone()
+        if not face:
+            raise ValueError(f"Face not found: {face_id}")
+        keep = conn.execute(
+            f"{_PERSON_SELECT} WHERE p.id = ?", (keep_id,)
+        ).fetchone()
+        if not keep:
+            raise ValueError(f"Person not found: {keep_id}")
+        old_pid = int(face["person_id"]) if face["person_id"] is not None else None
+        if face["person_row_id"] is not None and old_pid == keep_id:
+            return {**_person_dict(keep), "face_id": face_id, "scope": "face"}
+        conn.execute(
+            "UPDATE faces SET person_id = ? WHERE id = ?",
+            (keep_id, face_id),
+        )
+        touched = [keep_id]
+        if old_pid and old_pid != keep_id:
+            touched.append(old_pid)
+        _recalc_people(conn, touched)
+        row = conn.execute(
+            f"{_PERSON_SELECT} WHERE p.id = ?", (keep_id,)
+        ).fetchone()
+        return {**_person_dict(row), "face_id": face_id, "scope": "face"}
+
+
 def recluster_people(
     person_ids: list[int], threshold: float | None = None
 ) -> dict[str, Any]:
@@ -1528,8 +1570,8 @@ def photos_for_person(
               p.id, p.source_id, p.path, p.rel_path, p.mtime, p.album,
               p.culled, p.group_id, p.is_keeper, p.content_id,
               s.label AS source_label,
-              c.file_hash, c.size, c.width, c.height, c.taken_at, c.camera,
-              c.lat, c.lon, c.gps, c.venue, c.city, c.region, c.country, c.place_label,
+              c.file_hash, c.size, c.width, c.height, c.taken_at, c.taken_at_source, c.camera,
+              c.lat, c.lon, c.gps, c.coord_source, c.venue, c.city, c.region, c.country, c.place_label,
               c.orientation, c.mirrored, c.embedding_ready, c.faces_ready, c.indexed_at,
               f.id AS face_id, f.person_id, f.bbox_x, f.bbox_y, f.bbox_w, f.bbox_h,
               pe.name AS person_name
@@ -1600,8 +1642,8 @@ def photos_with_faces(
               p.id, p.source_id, p.path, p.rel_path, p.mtime, p.album,
               p.culled, p.group_id, p.is_keeper, p.content_id,
               s.label AS source_label,
-              c.file_hash, c.size, c.width, c.height, c.taken_at, c.camera,
-              c.lat, c.lon, c.gps, c.venue, c.city, c.region, c.country, c.place_label,
+              c.file_hash, c.size, c.width, c.height, c.taken_at, c.taken_at_source, c.camera,
+              c.lat, c.lon, c.gps, c.coord_source, c.venue, c.city, c.region, c.country, c.place_label,
               c.orientation, c.mirrored, c.embedding_ready, c.faces_ready, c.indexed_at
             FROM keepers k
             JOIN photos p ON p.id = k.photo_id

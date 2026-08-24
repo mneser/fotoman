@@ -10,25 +10,28 @@ from typing import Any, Iterator
 
 import numpy as np
 
+from fotoman.aspect import ASPECT_CLASS_SQL
 from fotoman.config import DB_PATH, DEFAULT_SOURCES, FAISS_PATH, IDS_PATH, THUMBS_DIR, ensure_dirs
 
 # Serialize all SQLite access across FastAPI/worker threads.
 _db_lock = threading.RLock()
 
+
 # Joined location + content row for reads (mirrors the old photos shape).
-PHOTO_SELECT = """
+PHOTO_SELECT = f"""
 SELECT
   p.id, p.source_id, p.path, p.rel_path, p.mtime, p.album,
   p.culled, p.missing, p.group_id, p.is_keeper, p.content_id,
   s.label AS source_label,
-  c.file_hash, c.size, c.width, c.height, c.taken_at, c.camera,
-  c.lat, c.lon, c.gps, c.venue, c.city, c.region, c.country, c.place_label,
+  c.file_hash, c.size, c.width, c.height, c.taken_at, c.taken_at_source, c.camera,
+  c.lat, c.lon, c.gps, c.coord_source, c.venue, c.city, c.region, c.country, c.place_label,
   c.orientation, c.mirrored, c.fingerprint, c.sharpness, c.exposure, c.quality,
-  c.embedding_ready, c.faces_ready, c.indexed_at
+  c.embedding_ready, c.faces_ready, c.indexed_at,
+  {ASPECT_CLASS_SQL} AS aspect_class
 FROM photos p
 JOIN photo_contents c ON c.id = p.content_id
 JOIN sources s ON s.id = p.source_id
-"""
+""".strip()
 
 
 SCHEMA = """
@@ -39,6 +42,11 @@ CREATE TABLE IF NOT EXISTS sources (
     enabled INTEGER NOT NULL DEFAULT 1,
     face_enabled INTEGER NOT NULL DEFAULT 0,
     embed_enabled INTEGER NOT NULL DEFAULT 0,
+    kind TEXT NOT NULL DEFAULT 'watched',
+    backup_collection_id INTEGER,
+    shadow_path TEXT,
+    shadow_enabled INTEGER NOT NULL DEFAULT 0,
+    sync_enabled INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     scanned_at TEXT,
     listed_at TEXT,
@@ -57,6 +65,7 @@ CREATE TABLE IF NOT EXISTS photo_contents (
     lat REAL,
     lon REAL,
     gps INTEGER NOT NULL DEFAULT 0,
+    coord_source TEXT,
     venue TEXT,
     city TEXT,
     region TEXT,
@@ -68,7 +77,7 @@ CREATE TABLE IF NOT EXISTS photo_contents (
     sharpness REAL,
     exposure REAL,
     quality REAL,
-    embedding_ready INTEGER NOT NULL DEFAULT 0,
+    embedding_ready INTEGER NOT NULL DEFAULT 0,  -- 0 pending, 1 in FAISS, 2 unreadable
     faces_ready INTEGER NOT NULL DEFAULT 0,
     near_edges_ready INTEGER NOT NULL DEFAULT 0,
     indexed_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -182,23 +191,25 @@ CREATE TABLE IF NOT EXISTS faces (
 CREATE INDEX IF NOT EXISTS idx_faces_content ON faces(content_id);
 CREATE INDEX IF NOT EXISTS idx_faces_person ON faces(person_id);
 
-CREATE TABLE IF NOT EXISTS virtual_folders (
+CREATE TABLE IF NOT EXISTS collections (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
+    parent_id INTEGER REFERENCES collections(id) ON DELETE CASCADE,
+    link_group_by TEXT,
+    link_key TEXT,
+    fotomob_shared INTEGER NOT NULL DEFAULT 1,
+    fotomob_share_token TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_virtual_folders_name_unique
-ON virtual_folders(lower(trim(name)));
-
-CREATE TABLE IF NOT EXISTS virtual_folder_members (
-    folder_id INTEGER NOT NULL REFERENCES virtual_folders(id) ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS collection_members (
+    collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
     content_id INTEGER NOT NULL REFERENCES photo_contents(id) ON DELETE CASCADE,
     added_at TEXT NOT NULL DEFAULT (datetime('now')),
-    PRIMARY KEY (folder_id, content_id)
+    PRIMARY KEY (collection_id, content_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_vfolder_members_content ON virtual_folder_members(content_id);
+CREATE INDEX IF NOT EXISTS idx_collection_members_content ON collection_members(content_id);
 """
 
 
@@ -241,6 +252,81 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
 
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _migrate_rename_collections(conn: sqlite3.Connection) -> None:
+    """Rename virtual_folders → collections (and related columns/indexes)."""
+    if _table_exists(conn, "virtual_folders") and not _table_exists(conn, "collections"):
+        conn.execute("ALTER TABLE virtual_folders RENAME TO collections")
+    if _table_exists(conn, "virtual_folder_members") and not _table_exists(
+        conn, "collection_members"
+    ):
+        conn.execute("ALTER TABLE virtual_folder_members RENAME TO collection_members")
+    if _table_exists(conn, "collection_members"):
+        cols = _columns(conn, "collection_members")
+        if "folder_id" in cols and "collection_id" not in cols:
+            conn.execute(
+                "ALTER TABLE collection_members RENAME COLUMN folder_id TO collection_id"
+            )
+    conn.execute("DROP INDEX IF EXISTS idx_vfolder_members_content")
+    conn.execute("DROP INDEX IF EXISTS idx_vfolders_share_token")
+    conn.execute("DROP INDEX IF EXISTS idx_vfolders_sibling_name")
+    conn.execute("DROP INDEX IF EXISTS idx_virtual_folders_name_unique")
+
+
+def _ensure_collections_tree(conn: sqlite3.Connection) -> None:
+    if not _table_exists(conn, "collections"):
+        return
+    cols = _columns(conn, "collections")
+    if "parent_id" not in cols:
+        conn.execute(
+            "ALTER TABLE collections ADD COLUMN parent_id INTEGER "
+            "REFERENCES collections(id) ON DELETE CASCADE"
+        )
+    if "link_group_by" not in cols:
+        conn.execute("ALTER TABLE collections ADD COLUMN link_group_by TEXT")
+    if "link_key" not in cols:
+        conn.execute("ALTER TABLE collections ADD COLUMN link_key TEXT")
+    if "fotomob_shared" not in cols:
+        conn.execute(
+            "ALTER TABLE collections ADD COLUMN fotomob_shared INTEGER NOT NULL DEFAULT 1"
+        )
+    if "fotomob_share_token" not in cols:
+        conn.execute("ALTER TABLE collections ADD COLUMN fotomob_share_token TEXT")
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_collections_share_token
+        ON collections(fotomob_share_token)
+        WHERE fotomob_share_token IS NOT NULL AND trim(fotomob_share_token) != ''
+        """
+    )
+    import secrets
+
+    conn.execute("UPDATE collections SET fotomob_shared = 1")
+    missing = conn.execute(
+        """
+        SELECT id FROM collections
+        WHERE fotomob_share_token IS NULL OR trim(fotomob_share_token) = ''
+        """
+    ).fetchall()
+    for row in missing:
+        conn.execute(
+            "UPDATE collections SET fotomob_share_token = ? WHERE id = ?",
+            (secrets.token_urlsafe(8), int(row["id"])),
+        )
+    conn.execute("DROP INDEX IF EXISTS idx_virtual_folders_name_unique")
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_collections_sibling_name
+        ON collections(COALESCE(parent_id, 0), lower(trim(name)))
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_collection_members_content
+        ON collection_members(content_id)
+        """
+    )
 
 
 def _ensure_people_name_unique(conn: sqlite3.Connection) -> None:
@@ -327,6 +413,29 @@ def _ensure_source_columns(conn: sqlite3.Connection) -> None:
             WHERE EXISTS (SELECT 1 FROM photos p WHERE p.source_id = sources.id)
             """
         )
+    if src_cols and "kind" not in src_cols:
+        conn.execute(
+            "ALTER TABLE sources ADD COLUMN kind TEXT NOT NULL DEFAULT 'watched'"
+        )
+    if src_cols and "backup_folder_id" in src_cols and "backup_collection_id" not in src_cols:
+        conn.execute(
+            "ALTER TABLE sources RENAME COLUMN backup_folder_id TO backup_collection_id"
+        )
+    if src_cols and "backup_collection_id" not in src_cols and "backup_folder_id" not in src_cols:
+        conn.execute("ALTER TABLE sources ADD COLUMN backup_collection_id INTEGER")
+    if src_cols and "shadow_path" not in src_cols:
+        conn.execute("ALTER TABLE sources ADD COLUMN shadow_path TEXT")
+    if src_cols and "shadow_enabled" not in src_cols:
+        conn.execute(
+            "ALTER TABLE sources ADD COLUMN shadow_enabled INTEGER NOT NULL DEFAULT 0"
+        )
+    if src_cols and "sync_enabled" not in src_cols:
+        conn.execute(
+            "ALTER TABLE sources ADD COLUMN sync_enabled INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.execute(
+            "UPDATE sources SET sync_enabled = 1 WHERE IFNULL(kind, '') = 'device'"
+        )
     pc_cols = _columns(conn, "photo_contents") if _table_exists(conn, "photo_contents") else set()
     photo_cols = _columns(conn, "photos") if _table_exists(conn, "photos") else set()
     if photo_cols and "missing" not in photo_cols:
@@ -383,6 +492,17 @@ def _ensure_source_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE photo_contents ADD COLUMN taken_at_source TEXT")
         # Existing dated rows were EXIF (or manual without provenance); leave NULL
         # so backfill does not overwrite them with filename/mtime.
+    if pc_cols and "coord_source" not in pc_cols:
+        conn.execute("ALTER TABLE photo_contents ADD COLUMN coord_source TEXT")
+        conn.execute(
+            """
+            UPDATE photo_contents SET coord_source = CASE
+                WHEN IFNULL(gps, 0) = 1 THEN 'exif'
+                WHEN lat IS NOT NULL AND lon IS NOT NULL THEN 'geocode'
+                ELSE NULL
+            END
+            """
+        )
     cache_cols = (
         _columns(conn, "place_geo_cache") if _table_exists(conn, "place_geo_cache") else set()
     )
@@ -1007,7 +1127,7 @@ def _clear_null_island_gps(conn: sqlite3.Connection) -> int:
     cur = conn.execute(
         """
         UPDATE photo_contents
-        SET lat = NULL, lon = NULL, gps = 0,
+        SET lat = NULL, lon = NULL, gps = 0, coord_source = NULL,
             venue = NULL, city = NULL, region = NULL, country = NULL, place_label = NULL
         WHERE lat IS NOT NULL AND lon IS NOT NULL
           AND ABS(lat) < 1e-5 AND ABS(lon) < 1e-5
@@ -1050,17 +1170,20 @@ def init_db() -> None:
         # Legacy DBs: migrate before applying the fresh SCHEMA creates.
         if _table_exists(conn, "photos") and "file_hash" in _columns(conn, "photos"):
             migrated = _migrate_legacy_photos_to_contents(conn)
+        _migrate_rename_collections(conn)
         conn.executescript(SCHEMA)
         if _table_exists(conn, "faces") and "photo_id" in _columns(conn, "faces"):
             migrated = _migrate_legacy_photos_to_contents(conn) or migrated
         multi_archive = _migrate_photos_multi_archive(conn)
         _ensure_source_columns(conn)
+        _ensure_collections_tree(conn)
         _ensure_people_name_unique(conn)
         _ensure_faces_foreign_keys(conn)
         _ensure_content_indexes(conn)
         _clear_null_island_gps(conn)
         _purge_orphan_photos(conn)
         from fotoman.geocode import (
+            clear_stale_country_geo_cache,
             normalize_freeform_places,
             normalize_place_structure,
             normalize_quebec_province,
@@ -1069,6 +1192,7 @@ def init_db() -> None:
         normalize_freeform_places(conn)
         normalize_place_structure(conn)
         normalize_quebec_province(conn)
+        clear_stale_country_geo_cache(conn)
         conn.execute(
             """
             INSERT OR IGNORE INTO index_job(id, running, phase, current, total, message, error, reembed)

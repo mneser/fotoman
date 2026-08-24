@@ -63,7 +63,7 @@ GOOGLE_TAKEOUT = ExportWizard(
         "Create export — Google may email when ready (often hours–days).",
         "Download ALL parts (…-001.zip, …-002.zip, …) into the watch directory.",
         "Re-run reclaim google takeout when downloads finish, or if still preparing.",
-        "Tip: for recurring sync, prefer `reclaim google pull` (API) over full Takeout.",
+        "No Google Cloud / OAuth setup needed for Takeout.",
     ],
 )
 

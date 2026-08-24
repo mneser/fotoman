@@ -90,15 +90,11 @@ def ask_photo(photo_id: int, prompt: str = "", task: str | None = None) -> dict:
         raise ValueError("Prompt is required")
 
     settings = load_settings()
-    provider = (settings.get("vqa_provider") or "openai").strip().lower()
-    if provider in ("", "none", "off"):
-        raise RuntimeError("VQA is not configured. Set a provider in Preferences.")
-
     api_key = str(settings.get("vqa_api_key") or "").strip()
-    if not api_key:
-        raise RuntimeError("VQA API key is missing. Add it in Preferences.")
+    base_url = str(settings.get("vqa_base_url") or "").strip().rstrip("/")
+    if not api_key or not base_url:
+        raise RuntimeError("VQA is not configured. Set a URL and API key in Preferences.")
 
-    base_url = (settings.get("vqa_base_url") or "https://api.openai.com/v1").rstrip("/")
     model = (settings.get("vqa_model") or "gpt-4o-mini").strip()
     if not model:
         raise RuntimeError("VQA model is missing. Set it in Preferences.")
@@ -106,10 +102,7 @@ def ask_photo(photo_id: int, prompt: str = "", task: str | None = None) -> dict:
     path = _photo_path(photo_id)
     data_url = _image_data_url(path)
 
-    if provider == "openai":
-        result = _openai_chat(base_url, api_key, model, prompt, data_url)
-    else:
-        raise RuntimeError(f"Unsupported VQA provider: {provider}")
+    result = _openai_chat(base_url, api_key, model, prompt, data_url)
 
     result["task"] = task_name
     if task_name == "where":

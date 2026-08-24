@@ -77,11 +77,17 @@ _COUNTRY_ALIASES: dict[str, str] = {
     "u.s.": "United States",
     "u.s.a.": "United States",
     "united states of america": "United States",
+    "uae": "United Arab Emirates",
+    "u.a.e": "United Arab Emirates",
+    "u.a.e.": "United Arab Emirates",
     "uk": "United Kingdom",
     "u.k.": "United Kingdom",
     "great britain": "United Kingdom",
     "england": "United Kingdom",
     "holland": "Netherlands",
+    "hongkong": "Hong Kong",
+    "hong kong sar": "Hong Kong",
+    "hong kong s.a.r.": "Hong Kong",
     "czechia": "Czechia",
     "czech republic": "Czechia",
     "russia": "Russia",
@@ -693,7 +699,19 @@ def query_matches_resolved(query: str, *parts: str | None) -> bool:
     hay: set[str] = set()
     for p in parts:
         hay.update(_place_tokens(p))
-    return all(t in hay for t in needed)
+    if all(t in hay for t in needed):
+        return True
+    # Alias-only queries ("UAE") do not appear as tokens in the long name.
+    q_country = known_country(query)
+    if not q_country:
+        return False
+    q_fold = _fold_place(q_country)
+    for p in parts:
+        if not p:
+            continue
+        if known_country(p) == q_country or q_fold in _fold_place(p):
+            return True
+    return False
 
 
 def _nominatim_freeform(query: str) -> dict[str, Any] | None:
@@ -891,6 +909,9 @@ def lookup_country_coords(
     if not fetch:
         return None
     details = _nominatim_country(country)
+    if not details:
+        # SARs / territories (Hong Kong) are not OSM structured country hits.
+        details = _nominatim_freeform(country)
     with db() as conn:
         if details:
             _cache_upsert(
@@ -982,8 +1003,26 @@ def enqueue_place_geocode(
         )
 
 
+def clear_stale_country_geo_cache(conn) -> None:
+    """Drop negative country cache from before freeform fallback (Hong Kong)."""
+    conn.execute(
+        """
+        DELETE FROM place_geo_cache
+        WHERE found = 0 AND lower(query) IN (
+            'country|hong kong',
+            'freeform|hong kong',
+            'freeform|hongkong',
+            'freeform|uae',
+            'freeform|u.a.e',
+            'freeform|u.a.e.',
+            'country|uae'
+        )
+        """
+    )
+
+
 def fill_missing_place_coords(*, fetch_limit: int = 0) -> int:
-    """Write city/region-center lat/lon onto contents that have place but no GPS.
+    """Write city/region/country-center lat/lon onto contents that have place but no GPS.
 
     Applies cached lookups immediately. Uncached places are enqueued for the
     background Nominatim worker (public API ~1 req/s). ``fetch_limit`` still
@@ -997,17 +1036,14 @@ def fill_missing_place_coords(*, fetch_limit: int = 0) -> int:
             """
             SELECT DISTINCT city, region, country FROM photo_contents
             WHERE country IS NOT NULL AND country != ''
-              AND (
-                    (city IS NOT NULL AND city != '')
-                 OR (region IS NOT NULL AND region != '')
-              )
-              AND IFNULL(gps, 0) = 0
+              AND IFNULL(coord_source, '') NOT IN ('exif', 'manual')
               AND (lat IS NULL OR lon IS NULL)
             """
         ).fetchall()
 
     pending_city: list[tuple[str, str | None, str]] = []
     pending_region: list[tuple[str, str]] = []
+    pending_country: list[str] = []
     for r in pairs:
         city, region, country = r["city"], r["region"], r["country"]
         if city:
@@ -1018,10 +1054,10 @@ def fill_missing_place_coords(*, fetch_limit: int = 0) -> int:
                     cur = conn.execute(
                         """
                         UPDATE photo_contents
-                        SET lat = ?, lon = ?, gps = 0
+                        SET lat = ?, lon = ?, gps = 0, coord_source = 'geocode'
                         WHERE city = ? AND country = ?
                           AND IFNULL(region, '') = IFNULL(?, '')
-                          AND IFNULL(gps, 0) = 0
+                          AND IFNULL(coord_source, '') NOT IN ('exif', 'manual')
                           AND (lat IS NULL OR lon IS NULL)
                         """,
                         (lat, lon, city, country, region),
@@ -1037,10 +1073,10 @@ def fill_missing_place_coords(*, fetch_limit: int = 0) -> int:
                     cur = conn.execute(
                         """
                         UPDATE photo_contents
-                        SET lat = ?, lon = ?, gps = 0
+                        SET lat = ?, lon = ?, gps = 0, coord_source = 'geocode'
                         WHERE (city IS NULL OR city = '')
                           AND region = ? AND country = ?
-                          AND IFNULL(gps, 0) = 0
+                          AND IFNULL(coord_source, '') NOT IN ('exif', 'manual')
                           AND (lat IS NULL OR lon IS NULL)
                         """,
                         (lat, lon, region, country),
@@ -1048,6 +1084,26 @@ def fill_missing_place_coords(*, fetch_limit: int = 0) -> int:
                     updated += int(cur.rowcount or 0)
             else:
                 pending_region.append((region, country))
+        else:
+            coords = lookup_country_coords(country, fetch=False)
+            if coords:
+                lat, lon = coords
+                with db() as conn:
+                    cur = conn.execute(
+                        """
+                        UPDATE photo_contents
+                        SET lat = ?, lon = ?, gps = 0, coord_source = 'geocode'
+                        WHERE country = ?
+                          AND (city IS NULL OR city = '')
+                          AND (region IS NULL OR region = '')
+                          AND IFNULL(coord_source, '') NOT IN ('exif', 'manual')
+                          AND (lat IS NULL OR lon IS NULL)
+                        """,
+                        (lat, lon, country),
+                    )
+                    updated += int(cur.rowcount or 0)
+            else:
+                pending_country.append(country)
 
     for city, region, country in pending_city:
         enqueue_place_geocode(
@@ -1055,6 +1111,8 @@ def fill_missing_place_coords(*, fetch_limit: int = 0) -> int:
         )
     for region, country in pending_region:
         enqueue_place_geocode(kind="region", region=region, country=country)
+    for country in pending_country:
+        enqueue_place_geocode(kind="country", country=country)
 
     fetches = 0
     limit = max(0, fetch_limit)
@@ -1070,10 +1128,10 @@ def fill_missing_place_coords(*, fetch_limit: int = 0) -> int:
             cur = conn.execute(
                 """
                 UPDATE photo_contents
-                SET lat = ?, lon = ?, gps = 0
+                SET lat = ?, lon = ?, gps = 0, coord_source = 'geocode'
                 WHERE city = ? AND country = ?
                   AND IFNULL(region, '') = IFNULL(?, '')
-                  AND IFNULL(gps, 0) = 0
+                  AND IFNULL(coord_source, '') NOT IN ('exif', 'manual')
                   AND (lat IS NULL OR lon IS NULL)
                 """,
                 (lat, lon, city, country, region),
@@ -1091,13 +1149,35 @@ def fill_missing_place_coords(*, fetch_limit: int = 0) -> int:
             cur = conn.execute(
                 """
                 UPDATE photo_contents
-                SET lat = ?, lon = ?, gps = 0
+                SET lat = ?, lon = ?, gps = 0, coord_source = 'geocode'
                 WHERE (city IS NULL OR city = '')
                   AND region = ? AND country = ?
-                  AND IFNULL(gps, 0) = 0
+                  AND IFNULL(coord_source, '') NOT IN ('exif', 'manual')
                   AND (lat IS NULL OR lon IS NULL)
                 """,
                 (lat, lon, region, country),
+            )
+            updated += int(cur.rowcount or 0)
+    for country in pending_country:
+        if fetches >= limit:
+            break
+        coords = lookup_country_coords(country, fetch=True)
+        fetches += 1
+        if not coords:
+            continue
+        lat, lon = coords
+        with db() as conn:
+            cur = conn.execute(
+                """
+                UPDATE photo_contents
+                SET lat = ?, lon = ?, gps = 0, coord_source = 'geocode'
+                WHERE country = ?
+                  AND (city IS NULL OR city = '')
+                  AND (region IS NULL OR region = '')
+                  AND IFNULL(coord_source, '') NOT IN ('exif', 'manual')
+                  AND (lat IS NULL OR lon IS NULL)
+                """,
+                (lat, lon, country),
             )
             updated += int(cur.rowcount or 0)
     return updated
@@ -1115,10 +1195,10 @@ def _apply_cached_coords_for_queue_item(kind: str, city, region, country) -> Non
             conn.execute(
                 """
                 UPDATE photo_contents
-                SET lat = ?, lon = ?, gps = 0
+                SET lat = ?, lon = ?, gps = 0, coord_source = 'geocode'
                 WHERE city = ? AND country = ?
                   AND IFNULL(region, '') = IFNULL(?, '')
-                  AND IFNULL(gps, 0) = 0
+                  AND IFNULL(coord_source, '') NOT IN ('exif', 'manual')
                   AND (lat IS NULL OR lon IS NULL)
                 """,
                 (lat, lon, city, country, region),
@@ -1132,10 +1212,10 @@ def _apply_cached_coords_for_queue_item(kind: str, city, region, country) -> Non
             conn.execute(
                 """
                 UPDATE photo_contents
-                SET lat = ?, lon = ?, gps = 0
+                SET lat = ?, lon = ?, gps = 0, coord_source = 'geocode'
                 WHERE (city IS NULL OR city = '')
                   AND region = ? AND country = ?
-                  AND IFNULL(gps, 0) = 0
+                  AND IFNULL(coord_source, '') NOT IN ('exif', 'manual')
                   AND (lat IS NULL OR lon IS NULL)
                 """,
                 (lat, lon, region, country),
@@ -1149,11 +1229,11 @@ def _apply_cached_coords_for_queue_item(kind: str, city, region, country) -> Non
             conn.execute(
                 """
                 UPDATE photo_contents
-                SET lat = ?, lon = ?, gps = 0
+                SET lat = ?, lon = ?, gps = 0, coord_source = 'geocode'
                 WHERE country = ?
                   AND (city IS NULL OR city = '')
                   AND (region IS NULL OR region = '')
-                  AND IFNULL(gps, 0) = 0
+                  AND IFNULL(coord_source, '') NOT IN ('exif', 'manual')
                   AND (lat IS NULL OR lon IS NULL)
                 """,
                 (lat, lon, country),
@@ -1223,8 +1303,8 @@ def _merge_place_from_details(
         canon = known_country(details["country"]) or normalize_country(details["country"])
         if canon:
             out["country"] = canon
-    if not out.get("city") and details.get("city"):
-        out["city"] = str(details["city"]).strip() or None
+    # Do not inject Nominatim locality as city. Venue + region labels such as
+    # "Buller Pass, Alberta, Canada" would otherwise grow the omitted district.
     out["place_label"] = (
         _format_place(
             out.get("city"),
@@ -1267,9 +1347,6 @@ def resolve_manual_place(
                 result = None
             if result and result.get("country"):
                 place = _merge_place_from_details(place, result)
-                # Keep parsed venue/city when Nominatim returns a locality.
-                if place.get("venue"):
-                    pass
                 coords = _coords_of(result)
                 if coords:
                     break
@@ -1476,10 +1553,10 @@ def _region_coords_on_conn(
 
 
 def normalize_quebec_province(conn) -> int:
-    """Rewrite bare Quebec city pins (gps=0) to Quebec province; clear bad cache.
+    """Rewrite bare Quebec city pins (geocode) to Quebec province; clear bad cache.
 
     ``Quebec`` / ``Québec`` means the province unless the city is explicitly
-    ``Quebec City``. Real EXIF GPS (gps=1) is left untouched.
+    ``Quebec City``. EXIF GPS and manual pins are left untouched.
     """
     # Drop freeform/city cache entries that resolved bare Quebec to the city.
     conn.execute(
@@ -1500,7 +1577,7 @@ def normalize_quebec_province(conn) -> int:
         """
         SELECT id, city, region, country, place_label
         FROM photo_contents
-        WHERE IFNULL(gps, 0) = 0
+        WHERE IFNULL(coord_source, '') NOT IN ('exif', 'manual')
           AND country IS NOT NULL AND country != ''
           AND city IS NOT NULL AND city != ''
         """
@@ -1519,7 +1596,7 @@ def normalize_quebec_province(conn) -> int:
                 """
                 UPDATE photo_contents
                 SET venue = NULL, city = NULL, region = ?, country = ?, place_label = ?,
-                    lat = ?, lon = ?, gps = 0
+                    lat = ?, lon = ?, gps = 0, coord_source = 'geocode'
                 WHERE id = ?
                 """,
                 ("Quebec", "Canada", place_label, coords[0], coords[1], r["id"]),
@@ -1529,7 +1606,7 @@ def normalize_quebec_province(conn) -> int:
                 """
                 UPDATE photo_contents
                 SET venue = NULL, city = NULL, region = ?, country = ?, place_label = ?,
-                    lat = NULL, lon = NULL, gps = 0
+                    lat = NULL, lon = NULL, gps = 0, coord_source = NULL
                 WHERE id = ?
                 """,
                 ("Quebec", "Canada", place_label, r["id"]),
@@ -1551,7 +1628,7 @@ def normalize_quebec_province(conn) -> int:
                 """
                 UPDATE photo_contents
                 SET venue = NULL, city = NULL, region = ?, country = ?, place_label = ?,
-                    lat = ?, lon = ?, gps = 0
+                    lat = ?, lon = ?, gps = 0, coord_source = 'geocode'
                 WHERE id = ?
                 """,
                 (

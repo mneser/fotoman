@@ -75,3 +75,21 @@ def test_sha1_stable(tmp_path: Path) -> None:
     f = tmp_path / "a.bin"
     f.write_bytes(b"hello")
     assert file_sha1(f) == file_sha1(f)
+
+
+def test_normalize_skips_html_json_payload(tmp_path: Path) -> None:
+    zpath = tmp_path / "facebook-html.zip"
+    _make_zip(
+        zpath,
+        {
+            "posts/media/a.jpg": b"jpeg-bytes",
+            "posts/your_posts.html": b"<html>huge</html>" * 1000,
+            "posts/posts.json": b'{"x":1}',
+        },
+    )
+    out = tmp_path / "out"
+    stats, code = normalize(zpath, out, source="facebook", dedup=DedupMode.SKIP)
+    assert code == ExitCode.OK
+    assert stats.extracted == 1
+    assert list(out.rglob("*.html")) == []
+    assert list((out / "facebook").rglob("*.jpg"))

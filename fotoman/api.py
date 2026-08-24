@@ -11,13 +11,28 @@ from fastapi.staticfiles import StaticFiles
 from starlette.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from fotoman.config import THUMBS_DIR, ensure_dirs, load_settings, public_settings, update_settings
+from fotoman.config import ROOT, THUMBS_DIR, ensure_dirs, load_settings, public_settings, update_settings
 from fotoman.db import content_thumb_path, db, init_db
-from fotoman import browse, duplicates, events, faces, indexer, properties, search, vfolders, vqa
+from fotoman import (
+    __version__,
+    backup,
+    browse,
+    collections,
+    device,
+    duplicates,
+    events,
+    faces,
+    indexer,
+    properties,
+    reclaim_import,
+    replica,
+    search,
+    vqa,
+)
 
-STATIC_DIR = Path(__file__).resolve().parent / "static"
+STATIC_DIR = ROOT / "fotoman" / "static"
 
-app = FastAPI(title="Fotoman", version="0.1.0")
+app = FastAPI(title="Fotoman", version=__version__)
 
 
 @app.middleware("http")
@@ -56,10 +71,23 @@ async def api_events():
 class SourceIn(BaseModel):
     path: str
     label: str | None = None
+    shadow_path: str | None = None
+    shadow_enabled: bool | None = None
+    sync_enabled: bool | None = None
+
+
+class DevicePairIn(BaseModel):
+    label: str | None = None
+    shadow_path: str | None = None
+    shadow_enabled: bool | None = None
+    sync_enabled: bool | None = None
 
 
 class SourceLabelIn(BaseModel):
-    label: str
+    label: str | None = None
+    shadow_path: str | None = None
+    shadow_enabled: bool | None = None
+    sync_enabled: bool | None = None
 
 
 class CullIn(BaseModel):
@@ -71,17 +99,56 @@ class KeeperIn(BaseModel):
     photo_id: int
 
 
+class WriteExifIn(BaseModel):
+    photo_ids: list[int]
+    taken_at: bool = True
+    gps: bool = True
+
+
 class PhotoIdsIn(BaseModel):
     photo_ids: list[int]
     delete_files: bool = False
 
 
-class VirtualFolderIn(BaseModel):
-    name: str
+class MoveMembersIn(BaseModel):
+    photo_ids: list[int]
+    from_collection_id: int
 
 
-class VirtualFolderNameIn(BaseModel):
+class ExportIn(BaseModel):
+    photo_ids: list[int]
+    dest: str
+
+
+class DestIn(BaseModel):
+    dest: str
+
+
+class ImportZipIn(BaseModel):
+    zip_path: str | None = None
+    dest: str | None = None
+
+
+class CollectionIn(BaseModel):
     name: str
+    parent_id: int | None = None
+
+
+class CollectionNameIn(BaseModel):
+    name: str | None = None
+    parent_id: int | None = None
+
+
+class CollectionExportIn(BaseModel):
+    dest: str
+    add_archive: bool = True
+    write_mtime: bool = True
+
+
+class ImportTreeIn(BaseModel):
+    group_by: str
+    key: str
+    parent_id: int | None = None
 
 
 class PhotoPropertiesPatch(BaseModel):
@@ -91,11 +158,15 @@ class PhotoPropertiesPatch(BaseModel):
     place_label: str | None = None
     orientation: int | None = None
     mirrored: bool | None = None
+    lat: float | None = None
+    lon: float | None = None
 
 
 class PhotoPropertiesIn(BaseModel):
     photo_ids: list[int]
     properties: PhotoPropertiesPatch
+    write_exif: bool = False
+    overwrite_coords: bool = False
 
 
 class RebuildDupesIn(BaseModel):
@@ -105,16 +176,20 @@ class RebuildDupesIn(BaseModel):
     near: bool = True
     photo_ids: list[int] | None = None
     include_culled: bool = False
+    persist: bool = True
+    clustering: str = Field(default=duplicates.CLUSTER_HASH_VECTOR, pattern="^(HASH_VECTOR|SCENE_MATCH)$")
 
 
 class PersonNameIn(BaseModel):
     name: str | None = None
     merge: bool = False
+    merge_into: int | None = None
 
 
 class FaceNameIn(BaseModel):
     name: str | None = None
     merge: bool = False
+    person_id: int | None = None
 
 
 class ReclusterPeopleIn(BaseModel):
@@ -133,7 +208,10 @@ class SettingsIn(BaseModel):
     face_match_threshold: float | None = Field(default=None, ge=0.2, le=0.9)
     date_tree_order: str | None = Field(default=None, pattern="^(newest|oldest)$")
     place_edit_nav: str | None = Field(default=None, pattern="^(stay|follow)$")
-    vqa_provider: str | None = None
+    write_date_to_exif: bool | None = None
+    write_date_to_mtime: bool | None = None
+    collection_copies: str | None = Field(default=None, pattern="^(primary|cluster)$")
+    fotomob_share_code: str | None = None
     vqa_api_key: str | None = None
     vqa_base_url: str | None = None
     vqa_model: str | None = None
@@ -145,7 +223,52 @@ class VqaIn(BaseModel):
     task: str | None = None
 
 
-def pick_directory(title: str = "Select photo archive") -> str | None:
+def _pick_tk(title: str, *, directory: bool) -> str | None:
+    kwargs: dict = {}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    flag = "--pick-folder" if directory else "--pick-file"
+    if getattr(sys, "frozen", False):
+        proc = subprocess.run(
+            [sys.executable, flag, title],
+            capture_output=True,
+            text=True,
+            **kwargs,
+        )
+    elif directory:
+        script = (
+            "import tkinter as tk\n"
+            "from tkinter import filedialog\n"
+            "root = tk.Tk(); root.withdraw(); root.attributes('-topmost', True)\n"
+            f"path = filedialog.askdirectory(title={title!r}) or ''\n"
+            "print(path); root.destroy()\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            **kwargs,
+        )
+    else:
+        script = (
+            "import tkinter as tk\n"
+            "from tkinter import filedialog\n"
+            "root = tk.Tk(); root.withdraw(); root.attributes('-topmost', True)\n"
+            f"path = filedialog.askopenfilename(title={title!r}, "
+            "filetypes=[('Zip archives', '*.zip'), ('All files', '*.*')]) or ''\n"
+            "print(path); root.destroy()\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            **kwargs,
+        )
+    path = (proc.stdout or "").strip()
+    return path or None
+
+
+def pick_directory(title: str = "Select photo volume") -> str | None:
     """Open a native OS folder dialog; return the path or None if cancelled."""
     if shutil.which("kdialog"):
         proc = subprocess.run(
@@ -165,21 +288,35 @@ def pick_directory(title: str = "Select photo archive") -> str | None:
         if proc.returncode == 0 and proc.stdout.strip():
             return proc.stdout.strip()
         return None
-    # tkinter in a subprocess avoids main-thread / server-thread issues
-    script = (
-        "import tkinter as tk\n"
-        "from tkinter import filedialog\n"
-        "root = tk.Tk(); root.withdraw(); root.attributes('-topmost', True)\n"
-        f"path = filedialog.askdirectory(title={title!r}) or ''\n"
-        "print(path); root.destroy()\n"
-    )
-    proc = subprocess.run(
-        [sys.executable, "-c", script],
-        capture_output=True,
-        text=True,
-    )
-    path = (proc.stdout or "").strip()
-    return path or None
+    return _pick_tk(title, directory=True)
+
+
+def pick_zip_file(title: str = "Select export zip") -> str | None:
+    """Open a native OS file dialog for a .zip; return the path or None if cancelled."""
+    if shutil.which("kdialog"):
+        proc = subprocess.run(
+            ["kdialog", "--title", title, "--getopenfilename", str(Path.home()), "*.zip"],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return proc.stdout.strip()
+        return None
+    if shutil.which("zenity"):
+        proc = subprocess.run(
+            [
+                "zenity",
+                "--file-selection",
+                f"--title={title}",
+                "--file-filter=Zip archives | *.zip",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return proc.stdout.strip()
+        return None
+    return _pick_tk(title, directory=False)
 
 
 @app.on_event("startup")
@@ -195,6 +332,9 @@ def _startup() -> None:
     from fotoman.geocode import start_geo_worker
 
     start_geo_worker()
+    from fotoman.fotomob_link import start_fotomob_link
+
+    start_fotomob_link()
     # Incremental reindex (list + hash/EXIF deltas) before geocode/embed/faces.
     indexer.start_scan_all_enabled(high_priority=True)
     # Auto-queue optional work for archives with face/embed enabled.
@@ -203,6 +343,8 @@ def _startup() -> None:
             "SELECT id, face_enabled, embed_enabled FROM sources WHERE enabled = 1"
         ).fetchall()
     for s in sources:
+        if backup.is_backup(dict(s)):
+            continue
         if s["embed_enabled"]:
             indexer.start_index_background(source_id=int(s["id"]), mode="embed")
         if s["face_enabled"]:
@@ -242,22 +384,144 @@ def api_sources():
             ).fetchall()
         ]
     for r in rows:
-        r["exists"] = Path(r["path"]).exists()
+        r.update(replica.annotate_source(r))
+        if backup.is_backup(r):
+            r.update(backup.status_for_source(r))
+    remounted = indexer.note_source_mounts(rows)
+    for sid in remounted:
+        src = next((r for r in rows if int(r["id"]) == int(sid)), None)
+        if src and backup.is_backup(src):
+            backup.start_sync_background(sid)
+        else:
+            indexer.start_index_background(source_id=sid, mode="scan", high_priority=True)
     return rows
 
 
 @app.post("/api/pick-directory")
-def api_pick_directory():
-    path = pick_directory()
+def api_pick_directory(title: str | None = None):
+    path = pick_directory(title or "Select photo volume")
     if not path:
         return {"path": None, "cancelled": True}
     return {"path": path, "cancelled": False}
+
+
+def _unique_export_path(dest_dir: Path, name: str) -> Path:
+    candidate = dest_dir / name
+    if not candidate.exists():
+        return candidate
+    stem = Path(name).stem
+    suffix = Path(name).suffix
+    n = 2
+    while True:
+        candidate = dest_dir / f"{stem}_{n}{suffix}"
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
+def _copy_photos_to_dest(items: list[tuple[int, str]], dest: Path) -> dict:
+    exported = 0
+    skipped = 0
+    failed = 0
+    errors: list[dict] = []
+    for pid, src_s in items:
+        if not src_s:
+            skipped += 1
+            continue
+        src = Path(src_s)
+        if not src.is_file():
+            skipped += 1
+            continue
+        try:
+            out = _unique_export_path(dest, src.name)
+            shutil.copy2(src, out)
+            exported += 1
+        except OSError as e:
+            failed += 1
+            if len(errors) < 5:
+                errors.append({"photo_id": pid, "error": str(e)})
+    return {
+        "exported": exported,
+        "skipped": skipped,
+        "failed": failed,
+        "dest": str(dest),
+        "errors": errors,
+    }
+
+
+@app.post("/api/photos/export")
+def api_export_photos(body: ExportIn):
+    """Copy selected photo files into dest (flat). Does not modify the library."""
+    dest = Path(body.dest).expanduser().resolve()
+    if not dest.is_dir():
+        raise HTTPException(400, "Destination is not a directory")
+    if not body.photo_ids:
+        return {"exported": 0, "skipped": 0, "failed": 0, "dest": str(dest), "errors": []}
+
+    ids = list(dict.fromkeys(int(i) for i in body.photo_ids))
+    placeholders = ",".join("?" * len(ids))
+    with db() as conn:
+        rows = conn.execute(
+            f"SELECT id, path FROM photos WHERE id IN ({placeholders})",
+            ids,
+        ).fetchall()
+    by_id = {int(r["id"]): r["path"] for r in rows}
+    items = [(pid, by_id.get(pid) or "") for pid in ids]
+    return _copy_photos_to_dest(items, dest)
+
+
+@app.post("/api/pick-zip")
+def api_pick_zip(title: str | None = None):
+    path = pick_zip_file(title or "Select Facebook / Google / Instagram zip")
+    if not path:
+        return {"path": None, "cancelled": True}
+    return {"path": path, "cancelled": False}
+
+
+@app.post("/api/sources/import-zip")
+def api_import_zip(body: ImportZipIn = ImportZipIn()):
+    """Pick (or accept) a zip, then unpack in the background and add as an archive."""
+    zip_path = (body.zip_path or "").strip() or None
+    if not zip_path:
+        zip_path = pick_zip_file("Select Facebook / Google / Instagram zip")
+        if not zip_path:
+            return {"path": None, "cancelled": True}
+    try:
+        st = reclaim_import.start_import_zip(zip_path, body.dest)
+    except (ValueError, RuntimeError) as e:
+        raise HTTPException(400, str(e)) from e
+    return {"cancelled": False, "started": True, **st}
+
+
+@app.post("/api/sources/pair-device")
+def api_pair_device(body: DevicePairIn = DevicePairIn()):
+    """Create a device archive and pairing link for a Fotomob phone."""
+    try:
+        return device.create_pair(
+            body.label,
+            shadow_path=body.shadow_path,
+            shadow_enabled=body.shadow_enabled,
+            sync_enabled=body.sync_enabled,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
 
 
 @app.post("/api/sources")
 def api_add_source(body: SourceIn):
     try:
         src = indexer.add_source(body.path, body.label)
+        fields = body.model_fields_set
+        if fields & {"shadow_path", "shadow_enabled", "sync_enabled"}:
+            src = replica.patch_source(
+                int(src["id"]),
+                shadow_path=body.shadow_path,
+                shadow_enabled=body.shadow_enabled,
+                sync_enabled=body.sync_enabled,
+                has_shadow_path="shadow_path" in fields,
+                has_shadow_enabled="shadow_enabled" in fields,
+                has_sync_enabled="sync_enabled" in fields,
+            )
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
     # List then index deltas (everything is new) ASAP.
@@ -310,6 +574,12 @@ def api_reindex_source(source_id: int):
         row = conn.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
     if not row:
         raise HTTPException(404, "Source not found")
+    src = dict(row)
+    if backup.is_backup(src):
+        try:
+            return backup.sync_backup(source_id)
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
     indexer.start_index_background(source_id=source_id, mode="scan", high_priority=True)
     if row["embed_enabled"]:
         indexer.start_index_background(source_id=source_id, mode="embed")
@@ -318,10 +588,34 @@ def api_reindex_source(source_id: int):
     return {"ok": True, "status": indexer.get_index_status()}
 
 
+@app.post("/api/sources/{source_id}/sync")
+def api_sync_backup(source_id: int, include_culled: bool = False):
+    """Incremental copy of the bound collection onto a backup archive."""
+    src = backup.get_source(source_id)
+    if not src:
+        raise HTTPException(404, "Source not found")
+    try:
+        return backup.sync_backup(source_id, include_culled=include_culled)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+
 @app.patch("/api/sources/{source_id}")
 def api_update_source(source_id: int, body: SourceLabelIn):
+    fields = body.model_fields_set
     try:
-        return indexer.set_source_label(source_id, body.label)
+        if "label" in fields and body.label is not None:
+            indexer.set_source_label(source_id, body.label)
+        src = device.patch_source(
+            source_id,
+            shadow_path=body.shadow_path if "shadow_path" in fields else None,
+            shadow_enabled=body.shadow_enabled if "shadow_enabled" in fields else None,
+            sync_enabled=body.sync_enabled if "sync_enabled" in fields else None,
+            has_shadow_path="shadow_path" in fields,
+            has_shadow_enabled="shadow_enabled" in fields,
+            has_sync_enabled="sync_enabled" in fields,
+        )
+        return src
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
 
@@ -382,7 +676,9 @@ def api_source_index_resume(source_id: int):
 @app.get("/api/index/status")
 def api_index_status():
     indexer.ensure_first_round_scans()
-    return indexer.get_index_status()
+    st = indexer.get_index_status()
+    st["import"] = reclaim_import.get_status()
+    return st
 
 
 @app.get("/api/places/suggest")
@@ -395,11 +691,23 @@ def api_map_photos(include_culled: bool = False):
     return search.map_photos(include_culled=include_culled)
 
 
+@app.get("/api/geocode/reverse")
+def api_reverse_geocode(lat: float, lon: float):
+    from fotoman.geocode import empty_place, is_valid_gps, reverse_one
+
+    if not is_valid_gps(lat, lon):
+        raise HTTPException(400, "Invalid coordinates")
+    try:
+        return reverse_one(lat, lon)
+    except Exception:
+        return empty_place()
+
+
 @app.get("/api/search")
 def api_search(
     q: str = Query("", min_length=0),
     mode: str = Query("visual", pattern="^(visual|meta|hybrid)$"),
-    top_k: int = Query(48, ge=1, le=200),
+    top_k: int = Query(48, ge=1, le=10000),
     place: str | None = None,
     lat: float | None = None,
     lon: float | None = None,
@@ -408,54 +716,50 @@ def api_search(
     taken_to: str | None = None,
     album: str | None = None,
     camera: str | None = None,
+    aspect: str | None = None,
     source_id: int | None = None,
     has_gps: bool | None = None,
     keepers_only: bool = False,
     include_culled: bool = False,
     content_ids: str | None = None,
+    collection_id: int | None = None,
+    collection: str | None = None,
+    person_id: int | None = None,
+    include_subfolders: bool = True,
 ):
     allow: set[int] | None = None
     if content_ids and content_ids.strip():
         allow = {int(x) for x in content_ids.split(",") if x.strip().isdigit()}
-    if mode == "meta":
-        return search.search_metadata(
-            text=q or None,
-            taken_from=taken_from,
-            taken_to=taken_to,
-            camera=camera,
-            album=album,
-            place=place,
-            lat=lat,
-            lon=lon,
-            radius_km=radius_km,
-            has_gps=has_gps,
-            source_id=source_id,
-            keepers_only=keepers_only,
-            include_culled=include_culled,
-            content_ids=allow,
-            limit=top_k,
-        )
-    if not q.strip():
-        raise HTTPException(400, "Query text required for visual/hybrid search")
-    if mode == "hybrid":
-        return search.hybrid_search(
-            q,
-            top_k=top_k,
-            place=place,
-            lat=lat,
-            lon=lon,
-            radius_km=radius_km,
-            taken_from=taken_from,
-            taken_to=taken_to,
-            album=album,
-            camera=camera,
-            source_id=source_id,
-            include_culled=include_culled,
-            content_ids=allow,
-        )
-    return search.search_visual(
-        q, top_k=top_k, include_culled=include_culled, content_ids=allow
+    filters = dict(
+        taken_from=taken_from,
+        taken_to=taken_to,
+        camera=camera,
+        album=album,
+        aspect=aspect,
+        place=place,
+        lat=lat,
+        lon=lon,
+        radius_km=radius_km,
+        has_gps=has_gps,
+        source_id=source_id,
+        keepers_only=keepers_only,
+        include_culled=include_culled,
+        content_ids=allow,
+        collection_id=collection_id,
+        collection=collection,
+        person_id=person_id,
+        include_subfolders=include_subfolders,
     )
+    try:
+        if mode == "meta":
+            return search.search_metadata(text=q or None, limit=top_k, **filters)
+        if not q.strip():
+            raise HTTPException(400, "Query text required for visual/hybrid search")
+        if mode == "hybrid":
+            return search.hybrid_search(q, top_k=top_k, **filters)
+        return search.search_visual(q, top_k=top_k, **filters)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
 
 
 @app.get("/api/search/similar")
@@ -516,7 +820,7 @@ def api_browse_location_tree(include_culled: bool = False):
 
 @app.get("/api/browse/groups")
 def api_browse_groups(
-    group_by: str = Query("camera", pattern="^(camera|date|location|album)$"),
+    group_by: str = Query("camera", pattern="^(camera|date|location|album|aspect)$"),
     include_culled: bool = False,
 ):
     return browse.group_list(group_by, include_culled=include_culled)
@@ -526,7 +830,7 @@ def api_browse_groups(
 def api_browse_photos(
     group_by: str = Query(
         "folder",
-        pattern="^(folder|camera|date|location|album|cluster|person|remove|vfolder)$",
+        pattern="^(folder|camera|date|location|album|cluster|person|remove|collection|aspect)$",
     ),
     key: str = Query(""),
     limit: int = Query(200, ge=1, le=10000),
@@ -544,61 +848,164 @@ def api_browse_photos(
     )
 
 
-@app.get("/api/virtual-folders")
-def api_list_virtual_folders(include_culled: bool = False):
-    return vfolders.list_folders(include_culled=include_culled)
+@app.get("/api/collections")
+def api_list_collections(include_culled: bool = False):
+    return collections.list_collections(include_culled=include_culled)
 
 
-@app.post("/api/virtual-folders")
-def api_create_virtual_folder(body: VirtualFolderIn):
+@app.post("/api/collections")
+def api_create_collection(body: CollectionIn):
     try:
-        return vfolders.create_folder(body.name)
+        return collections.create_collection(body.name, parent_id=body.parent_id)
+    except KeyError as e:
+        raise HTTPException(404, "Not found") from e
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
-    except vfolders.NameConflict as e:
+    except collections.NameConflict as e:
         raise HTTPException(
             409,
             detail={"code": "name_conflict", "existing": e.existing},
         ) from e
 
 
-@app.patch("/api/virtual-folders/{folder_id}")
-def api_rename_virtual_folder(folder_id: int, body: VirtualFolderNameIn):
+@app.patch("/api/collections/{collection_id}")
+def api_rename_collection(collection_id: int, body: CollectionNameIn):
     try:
-        return vfolders.rename_folder(folder_id, body.name)
+        out = None
+        if body.name is not None or "parent_id" in body.model_fields_set:
+            out = collections.rename_collection(
+                collection_id,
+                name=body.name,
+                parent_id=body.parent_id,
+                set_parent="parent_id" in body.model_fields_set,
+            )
+        if out is None:
+            out = collections.get_collection(collection_id)
+        if out is None:
+            raise KeyError("not found")
+        return out
     except KeyError as e:
         raise HTTPException(404, "Not found") from e
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
-    except vfolders.NameConflict as e:
+    except collections.NameConflict as e:
         raise HTTPException(
             409,
             detail={"code": "name_conflict", "existing": e.existing},
         ) from e
 
 
-@app.delete("/api/virtual-folders/{folder_id}")
-def api_delete_virtual_folder(folder_id: int):
+@app.delete("/api/collections/{collection_id}")
+def api_delete_collection(collection_id: int):
     try:
-        return vfolders.delete_folder(folder_id)
+        return collections.delete_collection(collection_id)
     except KeyError as e:
         raise HTTPException(404, "Not found") from e
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
 
 
-@app.post("/api/virtual-folders/{folder_id}/members")
-def api_add_virtual_folder_members(folder_id: int, body: PhotoIdsIn):
+@app.post("/api/collections/{collection_id}/members")
+def api_add_collection_members(collection_id: int, body: PhotoIdsIn):
     try:
-        return vfolders.add_members(folder_id, body.photo_ids)
+        return collections.add_members(collection_id, body.photo_ids)
     except KeyError as e:
         raise HTTPException(404, "Not found") from e
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
 
 
-@app.delete("/api/virtual-folders/{folder_id}/members")
-def api_remove_virtual_folder_members(folder_id: int, body: PhotoIdsIn):
+@app.post("/api/collections/{collection_id}/members/move")
+def api_move_collection_members(collection_id: int, body: MoveMembersIn):
     try:
-        return vfolders.remove_members(folder_id, body.photo_ids)
+        return collections.move_members(
+            body.from_collection_id, collection_id, body.photo_ids
+        )
     except KeyError as e:
         raise HTTPException(404, "Not found") from e
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+@app.post("/api/collections/import-tree")
+def api_import_collection_tree_root(
+    body: ImportTreeIn,
+    include_culled: bool = False,
+):
+    try:
+        return collections.import_browse_branch(
+            body.parent_id,
+            body.group_by,
+            body.key,
+            include_culled=include_culled,
+        )
+    except KeyError as e:
+        raise HTTPException(404, str(e) if str(e) else "Not found") from e
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    except collections.NameConflict as e:
+        raise HTTPException(
+            409,
+            detail={"code": "name_conflict", "existing": e.existing},
+        ) from e
+
+
+@app.post("/api/collections/{collection_id}/import-tree")
+def api_import_collection_tree(
+    collection_id: int,
+    body: ImportTreeIn,
+    include_culled: bool = False,
+):
+    try:
+        return collections.import_browse_branch(
+            collection_id,
+            body.group_by,
+            body.key,
+            include_culled=include_culled,
+        )
+    except KeyError as e:
+        raise HTTPException(404, str(e) if str(e) else "Not found") from e
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    except collections.NameConflict as e:
+        raise HTTPException(
+            409,
+            detail={"code": "name_conflict", "existing": e.existing},
+        ) from e
+
+
+@app.delete("/api/collections/{collection_id}/members")
+def api_remove_collection_members(collection_id: int, body: PhotoIdsIn):
+    try:
+        return collections.remove_members(collection_id, body.photo_ids)
+    except KeyError as e:
+        raise HTTPException(404, "Not found") from e
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+@app.post("/api/collections/{collection_id}/export")
+def api_export_collection(
+    collection_id: int,
+    body: CollectionExportIn,
+    include_culled: bool = False,
+):
+    """Copy a collection tree into dest/<name>/… and add it as a backup archive."""
+    dest = Path(body.dest).expanduser().resolve()
+    if not dest.is_dir():
+        raise HTTPException(400, "Destination is not a directory")
+    try:
+        return collections.export_collection(
+            collection_id,
+            dest,
+            include_culled=include_culled,
+            write_mtime=body.write_mtime,
+            add_archive=body.add_archive,
+        )
+    except KeyError as e:
+        raise HTTPException(404, "Not found") from e
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
 
 
 @app.get("/api/browse/clusters")
@@ -618,6 +1025,8 @@ def api_browse_people(labeled: bool | None = None):
 @app.patch("/api/people/{person_id}")
 def api_update_person(person_id: int, body: PersonNameIn):
     try:
+        if body.merge_into is not None:
+            return faces.merge_people(int(body.merge_into), person_id)
         return faces.set_person_name(person_id, body.name, merge=body.merge)
     except faces.NameConflict as e:
         raise HTTPException(
@@ -631,6 +1040,8 @@ def api_update_person(person_id: int, body: PersonNameIn):
 @app.patch("/api/faces/{face_id}")
 def api_update_face(face_id: int, body: FaceNameIn):
     try:
+        if body.person_id is not None:
+            return faces.assign_face_to_person(face_id, body.person_id)
         return faces.set_face_name(face_id, body.name, merge=body.merge)
     except faces.NameConflict as e:
         raise HTTPException(
@@ -759,6 +1170,8 @@ def api_rebuild_dupes(body: RebuildDupesIn | None = None):
         near=body.near,
         photo_ids=body.photo_ids,
         include_culled=body.include_culled,
+        persist=body.persist,
+        clustering=body.clustering,
     )
 
 
@@ -780,9 +1193,34 @@ def api_set_keeper(body: KeeperIn):
 def api_photo_properties(body: PhotoPropertiesIn):
     props = body.properties.model_dump(exclude_unset=True)
     try:
-        return properties.apply_properties(body.photo_ids, props)
+        return properties.apply_properties(
+            body.photo_ids,
+            props,
+            write_to_exif=body.write_exif,
+            overwrite_coords=body.overwrite_coords,
+        )
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
+
+
+@app.post("/api/photos/file-meta")
+def api_photo_file_meta(body: PhotoIdsIn):
+    return properties.file_meta_for_photos(body.photo_ids)
+
+
+@app.post("/api/photos/write-exif")
+def api_photo_write_exif(body: WriteExifIn):
+    try:
+        return properties.write_exif(
+            body.photo_ids, taken_at=body.taken_at, gps=body.gps
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+@app.post("/api/photos/reload-exif-gps")
+def api_photo_reload_exif_gps(body: PhotoIdsIn):
+    return properties.reload_exif_coords(body.photo_ids)
 
 
 @app.post("/api/duplicates/remove")
@@ -846,9 +1284,15 @@ def api_thumb(photo_id: int):
 def api_original(photo_id: int):
     with db() as conn:
         row = conn.execute("SELECT path FROM photos WHERE id = ?", (photo_id,)).fetchone()
-    if not row or not Path(row["path"]).exists():
+    if not row:
         raise HTTPException(404, "Not found")
-    return FileResponse(row["path"])
+    path = Path(row["path"])
+    if path.exists():
+        return FileResponse(path)
+    local = device.readable_path(row["path"])
+    if local:
+        return FileResponse(local)
+    raise HTTPException(404, "Not found")
 
 
 @app.get("/api/settings")

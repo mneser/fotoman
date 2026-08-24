@@ -26,6 +26,17 @@ TAKEN_AT_SOURCE_RANK = {
     "manual": 100,
 }
 
+# Provenance for photo_contents lat/lon. Manual pins are sticky; EXIF GPS
+# beats city-center geocode; geocode never overwrites either.
+COORD_SOURCE_RANK = {
+    "geocode": 10,
+    "exif": 40,
+    "manual": 100,
+}
+
+EXIF_WRITE_SUFFIXES = {".jpg", ".jpeg", ".tif", ".tiff"}
+_COORD_EPS = 1e-5
+
 # 20yy[-_.]mm[-_.]dd with optional time; or compact 20yymmdd[HHMMSS].
 _DATE_SEP = re.compile(
     r"(?<!\d)(20\d{2}|19\d{2})[-_.](\d{2})[-_.](\d{2})"
@@ -206,32 +217,136 @@ def can_replace_taken_at(
     )
 
 
+def normalize_coord_source(value: Any) -> str | None:
+    src = str(value or "").strip().lower()
+    return src if src in COORD_SOURCE_RANK else None
+
+
+def infer_coord_source(row: dict[str, Any] | None) -> str | None:
+    """Resolve coord provenance from a photo/content row (legacy gps flag)."""
+    if not row:
+        return None
+    src = normalize_coord_source(row.get("coord_source"))
+    if src:
+        return src
+    if int(row.get("gps") or 0):
+        return "exif"
+    if row.get("lat") is not None and row.get("lon") is not None:
+        return "geocode"
+    return None
+
+
+def can_replace_coords(existing_source: str | None, new_source: str | None) -> bool:
+    """True when ``new_source`` may overwrite stored lat/lon."""
+    new_src = normalize_coord_source(new_source)
+    if not new_src:
+        return False
+    existing = normalize_coord_source(existing_source)
+    if not existing:
+        return True
+    return COORD_SOURCE_RANK.get(new_src, 0) >= COORD_SOURCE_RANK.get(existing, 0)
+
+
+def gps_flag(coord_source: str | None) -> int:
+    """Keep legacy ``gps`` in sync: 1 only for camera EXIF GPS."""
+    return 1 if normalize_coord_source(coord_source) == "exif" else 0
+
+
+def can_write_exif(path: Path) -> bool:
+    return path.suffix.lower() in EXIF_WRITE_SUFFIXES
+
+
+def coords_close(
+    lat_a: float | None,
+    lon_a: float | None,
+    lat_b: float | None,
+    lon_b: float | None,
+    *,
+    eps: float = _COORD_EPS,
+) -> bool:
+    if lat_a is None or lon_a is None or lat_b is None or lon_b is None:
+        return lat_a is None and lon_a is None and lat_b is None and lon_b is None
+    try:
+        return abs(float(lat_a) - float(lat_b)) < eps and abs(float(lon_a) - float(lon_b)) < eps
+    except (TypeError, ValueError):
+        return False
+
+
+def mtime_to_taken_at(mtime: float | None) -> str | None:
+    if mtime is None:
+        return None
+    try:
+        return datetime.fromtimestamp(float(mtime)).strftime("%Y-%m-%d %H:%M:%S")
+    except (OSError, OverflowError, TypeError, ValueError):
+        return None
+
+
 def taken_at_to_exif(value: str) -> str:
     """DB/ISO taken_at → EXIF ``YYYY:MM:DD HH:MM:SS``."""
     return normalize_taken_at(value).replace("-", ":", 2)
+
+
+def _load_exif_dict(path: Path) -> dict[str, Any]:
+    import piexif
+
+    try:
+        return piexif.load(str(path))
+    except Exception:
+        return {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
+
+
+def _insert_exif_dict(path: Path, exif_dict: dict[str, Any]) -> None:
+    import piexif
+
+    piexif.insert(piexif.dump(exif_dict), str(path))
 
 
 def write_taken_at(path: Path, taken_at: str) -> None:
     """Write DateTimeOriginal / Digitized / DateTime into the image file (lossless JPEG/TIFF)."""
     import piexif
 
+    if not can_write_exif(path):
+        raise ValueError(f"Cannot write EXIF date for {path.suffix.lower() or 'unknown'} files")
+
     exif_str = taken_at_to_exif(taken_at)
     exif_bytes = exif_str.encode("ascii")
-    suffix = path.suffix.lower()
-    if suffix not in {".jpg", ".jpeg", ".tif", ".tiff"}:
-        raise ValueError(f"Cannot write EXIF date for {suffix or 'unknown'} files")
-
-    try:
-        exif_dict = piexif.load(str(path))
-    except Exception:
-        exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
-
+    exif_dict = _load_exif_dict(path)
     exif_dict.setdefault("0th", {})
     exif_dict.setdefault("Exif", {})
     exif_dict["0th"][piexif.ImageIFD.DateTime] = exif_bytes
     exif_dict["Exif"][piexif.ExifIFD.DateTimeOriginal] = exif_bytes
     exif_dict["Exif"][piexif.ExifIFD.DateTimeDigitized] = exif_bytes
-    piexif.insert(piexif.dump(exif_dict), str(path))
+    _insert_exif_dict(path, exif_dict)
+
+
+def _deg_to_dms_rational(deg: float) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]]:
+    deg = abs(float(deg))
+    d = int(deg)
+    ms = (deg - d) * 60.0
+    m = int(ms)
+    s = (ms - m) * 60.0
+    return ((d, 1), (m, 1), (int(round(s * 10000)), 10000))
+
+
+def write_gps(path: Path, lat: float, lon: float) -> None:
+    """Write GPSLatitude/Longitude into the image file (lossless JPEG/TIFF)."""
+    import piexif
+
+    from fotoman.geocode import is_valid_gps
+
+    if not can_write_exif(path):
+        raise ValueError(f"Cannot write EXIF GPS for {path.suffix.lower() or 'unknown'} files")
+    if not is_valid_gps(lat, lon):
+        raise ValueError("Invalid coordinates")
+
+    exif_dict = _load_exif_dict(path)
+    gps_ifd = exif_dict.setdefault("GPS", {})
+    gps_ifd[piexif.GPSIFD.GPSVersionID] = (2, 0, 0, 0)
+    gps_ifd[piexif.GPSIFD.GPSLatitudeRef] = b"N" if lat >= 0 else b"S"
+    gps_ifd[piexif.GPSIFD.GPSLatitude] = _deg_to_dms_rational(lat)
+    gps_ifd[piexif.GPSIFD.GPSLongitudeRef] = b"E" if lon >= 0 else b"W"
+    gps_ifd[piexif.GPSIFD.GPSLongitude] = _deg_to_dms_rational(lon)
+    _insert_exif_dict(path, exif_dict)
 
 
 def write_taken_at_mtime(path: Path, taken_at: str) -> float:
@@ -308,7 +423,16 @@ def _rational_to_float(value: Any) -> float | None:
         return None
 
 
-def _dms_to_deg(dms, ref: str | None) -> float | None:
+def _ref_letter(ref: Any) -> str | None:
+    if ref is None:
+        return None
+    if isinstance(ref, (bytes, bytearray)):
+        ref = ref.decode("ascii", "ignore")
+    text = str(ref).strip().upper()
+    return text[:1] if text else None
+
+
+def _dms_to_deg(dms, ref: Any) -> float | None:
     try:
         d = _rational_to_float(dms[0])
         m = _rational_to_float(dms[1])
@@ -316,11 +440,32 @@ def _dms_to_deg(dms, ref: str | None) -> float | None:
         if d is None or m is None or s is None:
             return None
         deg = d + m / 60.0 + s / 3600.0
-        if ref in {"S", "W"}:
+        if _ref_letter(ref) in {"S", "W"}:
             deg = -deg
         return deg
     except Exception:
         return None
+
+
+def _gps_via_piexif(path: Path) -> tuple[float | None, float | None]:
+    """Pillow often misses Android GPS IFDs; piexif reads the same JPEG bytes."""
+    try:
+        import piexif
+
+        gps = piexif.load(str(path)).get("GPS") or {}
+        if not gps:
+            return None, None
+        lat = _dms_to_deg(
+            gps.get(piexif.GPSIFD.GPSLatitude),
+            gps.get(piexif.GPSIFD.GPSLatitudeRef),
+        )
+        lon = _dms_to_deg(
+            gps.get(piexif.GPSIFD.GPSLongitude),
+            gps.get(piexif.GPSIFD.GPSLongitudeRef),
+        )
+        return _normalize_gps(lat, lon)
+    except Exception:
+        return None, None
 
 
 def _normalize_gps(lat: float | None, lon: float | None) -> tuple[float | None, float | None]:
@@ -396,6 +541,10 @@ def extract_exif(path: Path) -> dict[str, Any]:
                 out["lat"], out["lon"] = _normalize_gps(lat, lon)
     except Exception:
         pass
+    if out["lat"] is None or out["lon"] is None:
+        lat, lon = _gps_via_piexif(path)
+        if lat is not None and lon is not None:
+            out["lat"], out["lon"] = lat, lon
     return out
 
 
@@ -468,6 +617,10 @@ def extract_exif_and_thumbnail(path: Path, thumb_dest: Path, size: int = 384) ->
         # Fall back to header-only metadata if thumb fails mid-way
         if out["width"] is None:
             return extract_exif(path)
+    if out["lat"] is None or out["lon"] is None:
+        lat, lon = _gps_via_piexif(path)
+        if lat is not None and lon is not None:
+            out["lat"], out["lon"] = lat, lon
     return out
 
 
@@ -478,8 +631,29 @@ def album_from_rel(rel_path: str) -> str:
     return ""
 
 
-# Google Takeout / Albums folders that are never real places.
-_IGNORE_PLACE_LABELS = frozenset({"shared", "trash", "photos", "photo", "photos from"})
+# Folder names that are never real places (Takeout, phone albums, camera rolls).
+_IGNORE_PLACE_LABELS = frozenset(
+    {
+        "shared",
+        "trash",
+        "photos",
+        "photo",
+        "photos from",
+        "android",
+        "dcim",
+        "camera",
+        "download",
+        "downloads",
+        "pictures",
+        "screenshot",
+        "screenshots",
+        "whatsapp",
+        "images",
+        "img",
+        "movies",
+        "videos",
+    }
+)
 
 
 def is_ignored_place_label(label: str | None) -> bool:

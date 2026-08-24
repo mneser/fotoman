@@ -54,15 +54,15 @@ Official live photo APIs are **not equal**. Design around that; do not pretend o
 
 | Platform | Realistic automate? | How auth works | v1 approach |
 |----------|---------------------|----------------|-------------|
-| **Google Photos** | **Yes (best path)** | OAuth 2 in browser → refresh token stored under `~/.config/reclaim/` | **API pull** via Google Photos Library API: list + download originals into `-o` |
-| **Google Takeout** (full export) | Assist, not fully auto | You stay logged into Google in the **browser**; tool does not hold Takeout passwords | **Wizard:** open Takeout URL with Photos pre-hints, checklist, watch download dir for parts, then normalize |
+| **Google Photos** (Library API) | **No** (after 2025-03-31) | OAuth unused for reclaim; library-wide `photoslibrary.readonly` removed — API only sees app-uploaded media | Keep `google pull --force` as legacy/experiment only; **do not** pitch as flagship |
+| **Google Takeout** (full export) | Assist, not fully auto — **preferred Google path** | You stay logged into Google in the **browser**; tool does not hold Takeout passwords | **Wizard:** open Takeout URL with Photos pre-hints, checklist, watch download dir for parts, then normalize |
 | **Facebook** | Assist only (API nearly useless for personal full-res history) | Browser on facebook.com for DYI export; no app token required for v1 assist | **Wizard:** open DYI URL, instruct “Photos and videos,” watch `~/Downloads` (or `--watch-dir`) for zip, normalize |
 | **Instagram** | Assist official export; optional experimental pull later | Browser for accounts-center data download | **Wizard** same as FB; **experimental** unofficial pullers only behind `reclaim instagram experimental-pull` with loud ToS/breakage warnings — not default |
 
 **There is no single “log into Reclaimer”.** Auth is always platform-native:
 
-- **Google API path:** one-time `reclaim google auth` → browser consent screen → token on disk.
-- **Export wizards:** you authenticate in the browser session you already use; the CLI never sees your password.
+- **Google Takeout / FB / IG wizards:** you authenticate in the browser session you already use; the CLI never sees your password.
+- **Legacy Google API path:** optional `reclaim google auth` — cannot reclaim an existing library after Mar 2025.
 - **Never** ask for Facebook/Instagram passwords in the CLI.
 
 ---
@@ -71,17 +71,15 @@ Official live photo APIs are **not equal**. Design around that; do not pretend o
 
 ### In scope (v1) — download-first
 
-**Google Photos (flagship)**
+**Google Photos (Takeout is flagship; API pull is legacy)**
 
-- [ ] `reclaim google auth` — OAuth device/browser flow; store refresh token locally.
-- [ ] `reclaim google pull -o OUT` — download library (images; videos flaggable), resume-friendly, exact-hash skip/hardlink against existing `OUT`.
-- [ ] Incremental: skip media IDs / hashes already in manifest.
-- [ ] Albums best-effort via API where available.
-- [ ] Document Google Cloud project / OAuth client setup (user’s own client id, or shipped desktop client with clear quota limits).
+- [x] Document that Library API cannot read existing libraries after 2025-03-31.
+- [x] `reclaim google takeout` — preferred path.
+- [x] `reclaim google auth` / `pull --force` — legacy only; warn and point to Takeout.
 
-**Export assist (Facebook, Instagram, optional Google Takeout)**
+**Export assist (Facebook, Instagram, Google Takeout)**
 
-- [ ] `reclaim facebook fetch` / `reclaim instagram fetch` / `reclaim google takeout`
+- [x] `reclaim facebook fetch` / `reclaim instagram fetch` / `reclaim google takeout`
   - print short checklist,
   - `xdg-open` (or print) the correct request URL,
   - `--watch-dir` until expected zip(s) appear (and stabilize),
@@ -228,8 +226,9 @@ Exit codes: `0` ok, `1` usage/auth error, `2` partial, `3` fatal I/O, `4` waitin
 
 | Feature | Verdict |
 |---------|---------|
-| **Google Photos API pull + OAuth** | **Yes — core v1** |
-| **FB/IG/Takeout fetch wizards + zip watch** | **Yes — core v1** |
+| **Google Takeout fetch wizard + zip watch** | **Yes — core Google path** |
+| **Google Photos Library API pull + OAuth** | Legacy / broken for existing libraries (post-2025-03-31) |
+| **FB/IG fetch wizards + zip watch** | **Yes — core v1** |
 | Normalize + manifest + exact dedup | Yes — backend |
 | Near-dup / vault | No — Fotoman |
 | Default scraping / password auth | No |

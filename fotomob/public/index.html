@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <script>
+    (function () {
+      var p = location.pathname;
+      if (/^\/fotomob(\/|$)/.test(p)) document.write('<base href="/fotomob/">');
+      else if (/^\/[sd](\/|$)/.test(p)) document.write('<base href="/">');
+    })();
+  </script>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+  <meta name="theme-color" content="#1a1f1c" />
+  <meta name="theme-color" content="#1a1f1c" media="(prefers-color-scheme: light)" />
+  <meta name="theme-color" content="#1a1f1c" media="(prefers-color-scheme: dark)" />
+  <meta name="color-scheme" content="dark" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Fotomob" />
+  <title>Fotomob</title>
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="icon" href="icon-192.png" type="image/png" />
+  <link rel="apple-touch-icon" href="icon-192.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,600;9..40,700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="anonymous" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
+  <link rel="stylesheet" href="styles.css?v=45" />
+</head>
+<body>
+  <div id="splash" class="splash" aria-hidden="true">
+    <img src="fotomob.png" alt="" class="splash-logo" width="640" height="160">
+  </div>
+  <div class="chrome">
+    <div class="path-bar" id="path-bar">
+      <button type="button" id="path-banner" class="path-banner" aria-expanded="false" aria-controls="sheet" title="Open collections">
+        <span id="tree-label" class="tree-label"></span>
+      </button>
+      <div id="gallery-people" class="gallery-people" hidden></div>
+    </div>
+  </div>
+  <dialog id="about-dialog" class="about-dialog">
+    <form method="dialog">
+      <div class="shares-head">
+        <button type="button" id="about-back" class="nav-back" title="Back" aria-label="Back">‹</button>
+        <h2>Connections</h2>
+        <button type="button" id="qr-scan-btn" class="about-scan" data-qr-scan title="Scan QR" aria-label="Scan QR">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M3 3h8v8H3V3zm2 2v4h4V5H5zm8-2h8v8h-8V3zm2 2v4h4V5h-4zM3 13h8v8H3v-8zm2 2v4h4v-4H5zm13-2h3v3h-3v-3zm-3 3h3v3h-3v-3zm3 3h3v3h-3v-3zm-3 3h3v3h-3v-3z"/></svg>
+          Scan QR
+        </button>
+      </div>
+      <div class="about-body">
+        <img src="icon.png" alt="" class="about-icon" width="192" height="192">
+        <p class="about-name">Fotomob</p>
+        <p class="muted">Browse Fotoman collections on the go.</p>
+        <p class="about-version muted">Version <span id="about-version">0.2.5</span></p>
+      </div>
+      <div class="about-libraries">
+        <h3>Collections</h3>
+        <ul id="share-list" class="share-list"></ul>
+        <div class="device-archive">
+          <h3>Share to a Fotoman volume</h3>
+          <ul id="server-list" class="share-list server-list"></ul>
+          <input id="device-folder" class="device-folder" type="text" placeholder="Folder name (optional)" autocomplete="off" />
+          <div class="share-add-row">
+            <button type="button" id="device-pick-btn" disabled>Select</button>
+            <button type="button" id="device-upload-btn" disabled>Upload</button>
+          </div>
+          <div class="device-status-row">
+            <div id="device-busy" class="busy-iris busy-iris-sm" hidden role="status" aria-label="Uploading">
+              <img src="fotoman.png" alt="" draggable="false" />
+            </div>
+            <span id="device-status" class="muted"></span>
+          </div>
+          <input id="device-files" type="file" accept="image/*" multiple hidden />
+        </div>
+      </div>
+    </form>
+  </dialog>
+  <dialog id="qr-scan" class="qr-scan-dialog">
+    <video id="qr-scan-video" autoplay muted playsinline></video>
+    <div class="qr-scan-ui">
+      <div class="qr-scan-frame" aria-hidden="true"></div>
+      <p id="qr-scan-status" class="qr-scan-status">Point at a Fotoman QR</p>
+      <button type="button" id="qr-scan-close" class="about-back">Cancel</button>
+    </div>
+  </dialog>
+  <dialog id="share-dialog" class="share-out-dialog">
+    <form method="dialog" class="share-out-card">
+      <button type="submit" class="share-out-x" aria-label="Close">×</button>
+      <h2 id="share-out-title">Share collection</h2>
+      <p class="muted">Anyone with this link can view it on Fotomob.</p>
+      <div id="share-out-qr" class="share-out-qr" role="img" aria-label="Collection QR code"></div>
+      <div class="share-out-row">
+        <a id="share-out-wa" class="share-out-btn wa" target="_blank" rel="noopener">WhatsApp</a>
+        <button type="button" id="share-out-more" class="share-out-btn">Share…</button>
+      </div>
+    </form>
+  </dialog>
+  <div class="stage">
+  <img src="fotomob.png" alt="" class="stage-watermark" aria-hidden="true" width="640" height="160">
+  <p id="status" class="muted status" hidden></p>
+  <div id="empty-scan" class="empty-scan" hidden>
+    <img src="fotomob.png" alt="Fotomob" class="empty-scan-logo" width="640" height="160">
+    <button type="button" id="empty-qr-btn" class="about-scan" data-qr-scan title="Scan QR" aria-label="Scan QR">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M3 3h8v8H3V3zm2 2v4h4V5H5zm8-2h8v8h-8V3zm2 2v4h4V5h-4zM3 13h8v8H3v-8zm2 2v4h4v-4H5zm13-2h3v3h-3v-3zm-3 3h3v3h-3v-3zm3 3h3v3h-3v-3zm-3 3h3v3h-3v-3z"/></svg>
+      Scan QR
+    </button>
+  </div>
+  <section id="gallery" class="hist-rail" aria-live="polite"></section>
+  </div>
+  <div id="sheet-scrim" class="sheet-scrim" hidden></div>
+  <div id="sheet" class="sheet" aria-hidden="true">
+    <div class="sheet-grab" aria-hidden="true"></div>
+    <div class="sheet-head">
+      <div>
+        <h2>Collections</h2>
+        <p id="sheet-sub" class="muted">Choose a folder</p>
+      </div>
+      <button type="button" id="sheet-done" class="sheet-done">Done</button>
+    </div>
+    <div id="tree-body" class="sheet-body" aria-label="Collections"></div>
+  </div>
+  <section id="map-view" class="map-view" hidden>
+    <div class="map-bar">
+      <button type="button" id="btn-map-back" class="nav-back" title="Back" aria-label="Back">‹</button>
+      <span id="map-status" class="muted"></span>
+    </div>
+    <div id="photo-map" class="photo-map" role="application" aria-label="Photo map"></div>
+  </section>
+  <div id="lightbox" class="lightbox" hidden>
+    <div id="lightbox-stage" class="lightbox-stage">
+      <img id="lightbox-img" alt="" draggable="false" />
+    </div>
+    <div id="lightbox-busy" class="lightbox-busy" hidden>
+      <div class="busy-iris" role="status" aria-label="Loading photo">
+        <img src="fotoman.png" alt="" draggable="false" />
+      </div>
+    </div>
+    <button type="button" id="lightbox-back" class="nav-back nav-back-float" title="Back" aria-label="Back">‹</button>
+    <button type="button" id="lightbox-map" class="lightbox-map" title="Map" aria-label="Map of collection">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5A2.5 2.5 0 1 1 12 6.5a2.5 2.5 0 0 1 0 5z"/></svg>
+      Map
+    </button>
+    <span id="lightbox-count" class="lightbox-count" hidden></span>
+    <div id="lightbox-info" class="lightbox-info"></div>
+    <img src="fotomob.png" alt="" class="lightbox-watermark" aria-hidden="true" width="640" height="160">
+  </div>
+  <nav id="dock" class="dock" aria-label="App">
+    <div id="dock-tools" class="dock-tools">
+      <button type="button" id="btn-about" class="dock-btn" title="Connections" aria-label="Connections">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M3.9 12c0-1.71 1.39-3.1 3.1-3.1h4V7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h4v-1.9H7c-1.71 0-3.1-1.39-3.1-3.1zM8 13h8v-2H8v2zm9-6h-4v1.9h4c1.71 0 3.1 1.39 3.1 3.1s-1.39 3.1-3.1 3.1h-4V17h4c2.76 0 5-2.24 5-5s-2.24-5-5-5z"/></svg>
+      </button>
+      <button type="button" id="btn-search" class="dock-btn" title="Search" aria-label="Search" aria-pressed="false" aria-controls="search-form">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
+      </button>
+      <button type="button" id="hist-toggle-all" class="dock-btn hist-toggle" hidden data-state="expanded" title="Collapse all" aria-label="Collapse all">
+        <svg class="hist-icon-collapse" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M7.41 18.59 8.83 20 12 16.83 15.17 20l1.41-1.41L12 14l-4.59 4.59zm9.18-13.18L15.17 4 12 7.17 8.83 4 7.41 5.41 12 10z"/></svg>
+        <svg class="hist-icon-expand" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 5.83 15.17 9l1.41-1.41L12 3 7.41 7.59 8.83 9 12 5.83zm0 12.34L8.83 15l-1.41 1.41L12 21l4.59-4.59L15.17 15 12 18.17z"/></svg>
+      </button>
+      <button type="button" id="btn-map" class="dock-btn" hidden title="Map" aria-label="Map of collection">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5A2.5 2.5 0 1 1 12 6.5a2.5 2.5 0 0 1 0 5z"/></svg>
+      </button>
+      <button type="button" id="btn-install" class="dock-btn" hidden title="Install app" aria-label="Install app">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M5 20h14v-2H5v2zm7-3 5.5-5.5-1.42-1.42L13 14.67V4h-2v10.67L7.92 10.08 6.5 11.5 12 17z"/></svg>
+      </button>
+    </div>
+    <form id="search-form" class="dock-search" hidden autocomplete="off">
+      <input id="q" type="search" placeholder="Find…" enterkeyhint="search" aria-label="Find a photo" />
+      <button type="submit" class="search-go" title="Search" aria-label="Run search">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
+      </button>
+    </form>
+  </nav>
+  <div id="photo-loading" class="gallery-loading" hidden>
+    <div class="busy-iris" role="status" aria-label="Loading">
+      <img src="fotoman.png" alt="" draggable="false" />
+    </div>
+  </div>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+  <script src="app.js?v=45"></script>
+</body>
+</html>

@@ -9,8 +9,16 @@ from pathlib import Path
 from reclaim.paths import client_secrets_path, token_path
 from reclaim.util import ExitCode
 
-# Read-only library access. User must enable Photos Library API on their GCP project.
+# Legacy scope — Google removed library-wide read on 2025-03-31.
+# Prefer: reclaim google takeout (no OAuth).
 SCOPES = ["https://www.googleapis.com/auth/photoslibrary.readonly"]
+
+_LIBRARY_READ_DEAD = (
+    "As of 31 Mar 2025 Google no longer allows reading your existing Photos library "
+    "via the Library API (photoslibrary.readonly was removed).\n"
+    "Prefer: reclaim google takeout -o OUT\n"
+    "See reclaimer/README.md."
+)
 
 
 def _chmod_private(path: Path) -> None:
@@ -60,16 +68,18 @@ def run_auth(client_secrets: Path | None = None) -> ExitCode:
     from google_auth_oauthlib.flow import InstalledAppFlow
 
     secrets = client_secrets or client_secrets_path()
+    print(_LIBRARY_READ_DEAD)
+    print()
     if not secrets.exists():
         print(
-            "Missing OAuth client secrets.\n\n"
+            "Missing OAuth client secrets (legacy path only).\n\n"
             "1. Create a Google Cloud project\n"
-            "2. Enable the Photos Library API\n"
+            "2. Enable Photos Library API if listed (still cannot read your library)\n"
             "3. Create an OAuth client (Desktop app)\n"
             "4. Download JSON and save as:\n"
             f"   {client_secrets_path()}\n"
             "   or pass --client-secrets PATH\n\n"
-            "See reclaimer/README.md for details."
+            "You almost certainly want Takeout instead of this flow."
         )
         return ExitCode.USAGE
 

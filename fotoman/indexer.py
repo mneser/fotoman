@@ -19,10 +19,14 @@ from fotoman.index_store import get_store
 from fotoman.metadata import (
     album_from_rel,
     assess_quality_file,
+    can_replace_coords,
     can_replace_taken_at,
+    coords_close,
     extract_exif,
     extract_exif_and_thumbnail,
     file_sha1,
+    gps_flag,
+    infer_coord_source,
     pixel_fingerprint,
     is_ignored_place_label,
     place_from_rel,
@@ -33,6 +37,15 @@ ProgressCb = Callable[[dict[str, Any]], None]
 
 # Commit scan rows and persist job progress this often
 _SCAN_COMMIT_EVERY = 25
+# photo_contents.embedding_ready: 0 pending, 1 in FAISS, 2 unreadable (do not retry).
+EMBED_UNUSABLE = 2
+# Phone album names are not places — never folder-geocode device contents.
+_DEVICE_CONTENT_IDS_SQL = """
+SELECT p.content_id FROM photos p
+JOIN sources s ON s.id = p.source_id
+WHERE IFNULL(s.kind, '') = 'device'
+   OR p.path LIKE 'fotomob://device/%'
+"""
 
 _state: dict[str, Any] = {
     "running": False,
@@ -55,6 +68,8 @@ _preempt_for_scan = False
 _suspend_requested = False
 # True when face detection auto-paused heavy work and should resume it after.
 _paused_for_faces = False
+# Last known path.exists() per archive id (None until first /api/sources).
+_mount_seen: dict[int, bool] = {}
 
 
 def get_index_status() -> dict[str, Any]:
@@ -152,9 +167,9 @@ def _pending_embed_items(source_id: int | None = None) -> list[tuple[int, Path]]
             ).fetchall()
     items: list[tuple[int, Path]] = []
     for r in rows:
-        p = Path(r["path"])
-        if p.is_file():
-            items.append((int(r["content_id"]), p))
+        read = _readable_index_path(str(r["path"]), Path(r["path"]))
+        if read is not None:
+            items.append((int(r["content_id"]), read))
     return items
 
 
@@ -241,6 +256,74 @@ def add_source(path: str, label: str | None = None) -> dict[str, Any]:
         return dict(row)
 
 
+def add_linked_archive(
+    path: str,
+    label: str | None,
+    rows: list[tuple[int, str, str, float]],
+    *,
+    kind: str = "watched",
+    backup_collection_id: int | None = None,
+) -> dict[str, Any]:
+    """Add an archive whose files already share vault content (collection export).
+
+    Source + locations are committed together with ``scanned_at`` set so the
+    first-round indexer does not pick the folder up for a full scan/geocode.
+    """
+    p = Path(path).expanduser().resolve()
+    if not p.exists() or not p.is_dir():
+        raise ValueError(f"Source path does not exist or is not a directory: {p}")
+    lbl = label or p.name or str(p)
+    kind_s = str(kind or "watched").strip().lower() or "watched"
+    collection_id = int(backup_collection_id) if backup_collection_id is not None else None
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO sources(
+                path, label, enabled, listed_at, scanned_at, listed_count,
+                kind, backup_collection_id
+            )
+            VALUES (?, ?, 1, datetime('now'), datetime('now'), ?, ?, ?)
+            ON CONFLICT(path) DO UPDATE SET
+                label=excluded.label,
+                enabled=1,
+                listed_at=excluded.listed_at,
+                scanned_at=excluded.scanned_at,
+                listed_count=excluded.listed_count,
+                kind=excluded.kind,
+                backup_collection_id=excluded.backup_collection_id
+            """,
+            (str(p), lbl, len(rows), kind_s, collection_id),
+        )
+        row = conn.execute("SELECT * FROM sources WHERE path = ?", (str(p),)).fetchone()
+        sid = int(row["id"])
+        for content_id, path_s, rel, mtime in rows:
+            path_s = str(Path(path_s).expanduser().resolve())
+            conn.execute(
+                """
+                INSERT INTO photos(
+                    content_id, source_id, path, rel_path, mtime, album,
+                    culled, missing, is_keeper
+                ) VALUES (?, ?, ?, ?, ?, '', 0, 0, 1)
+                ON CONFLICT(source_id, path) DO UPDATE SET
+                    content_id=excluded.content_id,
+                    rel_path=excluded.rel_path,
+                    mtime=excluded.mtime,
+                    missing=0
+                """,
+                (int(content_id), sid, path_s, rel, float(mtime)),
+            )
+        conn.execute(
+            """
+            UPDATE sources SET listed_count = (
+                SELECT COUNT(*) FROM photos WHERE source_id = ?
+            ) WHERE id = ?
+            """,
+            (sid, sid),
+        )
+        row = conn.execute("SELECT * FROM sources WHERE id = ?", (sid,)).fetchone()
+        return dict(row)
+
+
 def set_source_enabled(source_id: int, enabled: bool) -> None:
     with db() as conn:
         conn.execute("UPDATE sources SET enabled = ? WHERE id = ?", (1 if enabled else 0, source_id))
@@ -255,7 +338,53 @@ def set_source_label(source_id: int, label: str) -> dict[str, Any]:
         if cur.rowcount == 0:
             raise ValueError(f"Source not found: {source_id}")
         row = conn.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
-        return dict(row)
+        out = dict(row)
+    from fotoman import device
+
+    if device.is_device_source(out):
+        return device.annotate_source(out)
+    return out
+
+
+def add_linked_locations(
+    source_id: int, rows: list[tuple[int, str, str, float]]
+) -> int:
+    """Insert photo locations that already share content (collection export)."""
+    if not rows:
+        return 0
+    sid = int(source_id)
+    with db() as conn:
+        n = 0
+        for content_id, path_s, rel, mtime in rows:
+            path_s = str(Path(path_s).expanduser().resolve())
+            cur = conn.execute(
+                """
+                INSERT INTO photos(
+                    content_id, source_id, path, rel_path, mtime, album,
+                    culled, missing, is_keeper
+                ) VALUES (?, ?, ?, ?, ?, '', 0, 0, 1)
+                ON CONFLICT(source_id, path) DO UPDATE SET
+                    content_id=excluded.content_id,
+                    rel_path=excluded.rel_path,
+                    mtime=excluded.mtime,
+                    missing=0
+                """,
+                (int(content_id), sid, path_s, rel, float(mtime)),
+            )
+            n += cur.rowcount
+        conn.execute(
+            """
+            UPDATE sources
+            SET listed_at = datetime('now'),
+                scanned_at = datetime('now'),
+                listed_count = (
+                    SELECT COUNT(*) FROM photos WHERE source_id = ?
+                )
+            WHERE id = ?
+            """,
+            (sid, sid),
+        )
+    return n
 
 
 def _other_source_for_path(
@@ -274,11 +403,21 @@ def _other_source_for_path(
 
 def remove_source(source_id: int) -> None:
     """Remove an archive and its location rows. Content/embeddings are retained."""
+    from fotoman import device
+
+    row = None
     with db() as conn:
         # Explicit delete: photos FK was dropped in a past migration, so CASCADE
         # cannot be relied on.
+        row = conn.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
         conn.execute("DELETE FROM photos WHERE source_id = ?", (source_id,))
         conn.execute("DELETE FROM sources WHERE id = ?", (source_id,))
+    if row:
+        src = dict(row)
+        if device.is_device_source(src):
+            pair = device.pair_id_from_path(src.get("path"))
+            if pair:
+                device.clear_cache(pair)
 
 
 def _take_pending() -> list[dict[str, Any]]:
@@ -336,7 +475,12 @@ def _enqueue_index_job_unlocked(job: dict[str, Any], *, high_priority: bool) -> 
 def _load_sources(source_id: int | None) -> list[dict[str, Any]]:
     with db() as conn:
         if source_id is None:
-            rows = conn.execute("SELECT * FROM sources WHERE enabled = 1").fetchall()
+            rows = conn.execute(
+                """
+                SELECT * FROM sources
+                WHERE enabled = 1 AND IFNULL(kind, 'watched') != 'backup'
+                """
+            ).fetchall()
         else:
             rows = conn.execute(
                 "SELECT * FROM sources WHERE id = ?", (source_id,)
@@ -358,30 +502,66 @@ def _mark_photos_missing(photo_ids: list[int], *, missing: bool) -> None:
         )
 
 
-def _list_source(src: dict[str, Any]) -> dict[str, Any]:
-    """Fast directory listing + delta vs indexed photos. Updates listed_at/count."""
+def note_source_mounts(sources: list[dict[str, Any]]) -> list[int]:
+    """Remember which archives are mounted. Return ids that just came back online.
+
+    First observation is not a remount (avoids scanning everything on startup).
+    Unplug marks that archive's locations missing immediately.
+    """
+    remounted: list[int] = []
+    unplugged: list[int] = []
+    with _lock:
+        live = {int(s["id"]) for s in sources}
+        for s in sources:
+            sid = int(s["id"])
+            exists = bool(s.get("exists"))
+            prev = _mount_seen.get(sid)
+            _mount_seen[sid] = exists
+            enabled = int(s.get("enabled") or 0) == 1
+            if exists and prev is False and enabled:
+                remounted.append(sid)
+            elif (not exists) and prev is True:
+                unplugged.append(sid)
+        for sid in [k for k in _mount_seen if k not in live]:
+            _mount_seen.pop(sid, None)
+    for sid in unplugged:
+        with db() as conn:
+            ids = [
+                int(r["id"])
+                for r in conn.execute(
+                    "SELECT id FROM photos WHERE source_id = ?", (sid,)
+                ).fetchall()
+            ]
+        _mark_photos_missing(ids, missing=True)
+    return remounted
+
+
+def _list_device_source(src: dict[str, Any]) -> dict[str, Any]:
+    """List a phone album from the persisted shadow catalog."""
+    from fotoman import device
+
     sid = int(src["id"])
-    root = Path(src["path"])
+    pair = device.pair_id_from_path(src.get("path"))
     label = src["label"]
-    if not root.exists():
+    files = device.get_catalog(pair) if pair else []
+    online = bool(pair and device.is_online(pair))
+    if not pair or not files:
         _set(
             phase="list",
             current=0,
             total=0,
-            message=f"Skipping missing source: {root}",
+            message=f"Waiting for album from {label}",
             source_id=sid,
             force_persist=True,
         )
         return {
             "source": src,
-            "listed_count": 0,
+            "listed_count": int(src.get("listed_count") or 0),
             "to_index": [],
             "removed_ids": [],
             "changed": False,
-            "missing": True,
+            "missing": False,
         }
-
-    files = list_image_files(root)
     _set(
         phase="list",
         current=0,
@@ -404,31 +584,31 @@ def _list_source(src: dict[str, Any]) -> dict[str, Any]:
         ).fetchall()
     by_path = {r["path"]: dict(r) for r in existing_rows}
 
-    to_index: list[tuple[Path, str, float, int, dict[str, Any] | None]] = []
+    to_index: list[tuple[Path, str, float, int, dict[str, Any] | None, str]] = []
     revive_ids: list[int] = []
     seen: set[str] = set()
-    for i, path in enumerate(files, 1):
+    for i, item in enumerate(files, 1):
         if i == 1 or i % 50 == 0 or i == len(files):
             _set(current=i, persist=False)
-        try:
-            st = path.stat()
-        except OSError:
-            continue
-        path_s = str(path)
-        seen.add(path_s)
-        existing = by_path.get(path_s)
-        # Re-index when size/mtime changed, or hash-linked stub still needs EXIF.
+        store = device.asset_path(pair, item["id"])
+        seen.add(store)
+        existing = by_path.get(store)
+        size = int(item.get("size") or 0)
+        mtime = float(item.get("mtime") or 0)
+        cached = device.has_local_copy(pair, item["id"], item.get("rel") or item.get("name"))
         if (
             existing
-            and existing["size"] == st.st_size
-            and abs((existing["mtime"] or 0) - st.st_mtime) < 0.001
+            and existing["size"] == size
+            and abs((existing["mtime"] or 0) - mtime) < 0.001
             and existing["width"] is not None
         ):
-            if int(existing.get("missing") or 0):
+            if int(existing.get("missing") or 0) and (cached or online):
                 revive_ids.append(int(existing["id"]))
             continue
-        rel = str(path.relative_to(root))
-        to_index.append((path, rel, st.st_mtime, st.st_size, existing))
+        if not cached and not online:
+            continue
+        rel = str(item.get("rel") or item.get("name") or item["id"])
+        to_index.append((Path(store), rel, mtime, size, existing, store))
 
     removed_ids = [int(r["id"]) for p, r in by_path.items() if p not in seen]
     if removed_ids:
@@ -469,9 +649,151 @@ def _list_source(src: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _list_source(src: dict[str, Any]) -> dict[str, Any]:
+    """Fast directory listing + delta vs indexed photos. Updates listed_at/count."""
+    from fotoman import device
+
+    if device.is_device_source(src):
+        return _list_device_source(src)
+
+    from fotoman import replica
+
+    sid = int(src["id"])
+    root = Path(src["path"])
+    label = src["label"]
+    files_by_rel = replica.union_files(src)
+    if not files_by_rel and not root.is_dir():
+        with db() as conn:
+            ids = [
+                int(r["id"])
+                for r in conn.execute(
+                    "SELECT id FROM photos WHERE source_id = ?", (sid,)
+                ).fetchall()
+            ]
+        _mark_photos_missing(ids, missing=True)
+        _set(
+            phase="list",
+            current=0,
+            total=0,
+            message=f"Skipping missing source: {root}",
+            source_id=sid,
+            force_persist=True,
+        )
+        return {
+            "source": src,
+            "listed_count": len(ids),
+            "to_index": [],
+            "removed_ids": ids,
+            "changed": False,
+            "missing": True,
+        }
+
+    files = list(files_by_rel.items())
+    _set(
+        phase="list",
+        current=0,
+        total=len(files),
+        message=f"Listing {label}",
+        source_id=sid,
+        force_persist=True,
+    )
+
+    with db() as conn:
+        existing_rows = conn.execute(
+            """
+            SELECT p.path, p.id, c.size, p.mtime, c.embedding_ready, p.content_id,
+                   c.width, p.missing
+            FROM photos p
+            JOIN photo_contents c ON c.id = p.content_id
+            WHERE p.source_id = ?
+            """,
+            (sid,),
+        ).fetchall()
+    by_path = {r["path"]: dict(r) for r in existing_rows}
+
+    to_index: list[tuple[Path, str, float, int, dict[str, Any] | None]] = []
+    revive_ids: list[int] = []
+    seen: set[str] = set()
+    for i, (rel, path) in enumerate(files, 1):
+        if i == 1 or i % 50 == 0 or i == len(files):
+            _set(current=i, persist=False)
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        store_path = str(root / rel)
+        seen.add(store_path)
+        existing = by_path.get(store_path)
+        # Re-index when size/mtime changed, or hash-linked stub still needs EXIF.
+        if (
+            existing
+            and existing["size"] == st.st_size
+            and abs((existing["mtime"] or 0) - st.st_mtime) < 0.001
+            and existing["width"] is not None
+        ):
+            if int(existing.get("missing") or 0):
+                revive_ids.append(int(existing["id"]))
+            continue
+        to_index.append((path, rel, st.st_mtime, st.st_size, existing, store_path))
+
+    removed_ids = [int(r["id"]) for p, r in by_path.items() if p not in seen]
+    if removed_ids:
+        _mark_photos_missing(removed_ids, missing=True)
+    if revive_ids:
+        _mark_photos_missing(revive_ids, missing=False)
+
+    listed_count = len(seen)
+    with db() as conn:
+        conn.execute(
+            """
+            UPDATE sources
+            SET listed_at = datetime('now'), listed_count = ?
+            WHERE id = ?
+            """,
+            (listed_count, sid),
+        )
+
+    changed = bool(to_index) or bool(removed_ids) or bool(revive_ids)
+    _set(
+        current=listed_count,
+        total=listed_count,
+        message=(
+            f"Listed {label}: {listed_count} files"
+            + (f", {len(to_index)} to index" if to_index else ", no changes")
+            + (f", {len(removed_ids)} missing" if removed_ids else "")
+            + (f", {len(revive_ids)} restored" if revive_ids else "")
+        ),
+        force_persist=True,
+    )
+    return {
+        "source": src,
+        "listed_count": listed_count,
+        "to_index": to_index,
+        "removed_ids": removed_ids,
+        "changed": changed,
+        "missing": False,
+    }
+
+
+def _index_item_parts(
+    item: tuple,
+) -> tuple[Path, str, float, int, dict[str, Any] | None, str]:
+    path, rel, mtime, size, existing = item[:5]
+    store_path = item[5] if len(item) > 5 else str(path)
+    return path, rel, float(mtime), int(size), existing, store_path
+
+
+def _readable_index_path(store_path: str, path: Path) -> Path | None:
+    from fotoman import device
+
+    if path.is_file():
+        return path
+    return device.readable_path(store_path)
+
+
 def _index_source_files(
     src: dict[str, Any],
-    to_index: list[tuple[Path, str, float, int, dict[str, Any] | None]],
+    to_index: list[tuple],
 ) -> tuple[int, list[tuple[int, Path]]]:
     """Hash-link then EXIF/thumb for listed deltas. Reuses content by hash.
 
@@ -507,10 +829,11 @@ def _index_source_files(
         fhash: str,
         size: int,
         mtime: float,
+        store_path: str | None = None,
     ) -> None:
         nonlocal discovered
         album = album_from_rel(rel)
-        path_s = str(path)
+        path_s = store_path or str(path)
         with db() as conn:
             existing = conn.execute(
                 """
@@ -569,18 +892,29 @@ def _index_source_files(
             to_embed.append((content_id, path))
 
     # Pass 1: hash + link (prioritize getting the archive into the index).
-    for i, (path, rel, mtime, size, _existing) in enumerate(to_index, 1):
+    for i, item in enumerate(to_index, 1):
+        path, rel, mtime, size, _existing, store_path = _index_item_parts(item)
         if i > 1 and (_should_preempt() or _should_pause_heavy()):
             _set(current=i - 1, force_persist=True)
             return discovered, to_embed
 
         _set(current=i, persist=False)
+        read_path = _readable_index_path(store_path, path)
+        if read_path is None:
+            continue
         try:
-            fhash = file_sha1(path)
+            fhash = file_sha1(read_path)
         except OSError:
             continue
 
-        link_hashed(path=path, rel=rel, fhash=fhash, size=size, mtime=mtime)
+        link_hashed(
+            path=read_path,
+            rel=rel,
+            fhash=fhash,
+            size=size,
+            mtime=mtime,
+            store_path=store_path,
+        )
         if i % _SCAN_COMMIT_EVERY == 0:
             _set(current=i, force_persist=True)
 
@@ -668,17 +1002,31 @@ def _index_source_files(
             with db() as conn:
                 # Another path may have filled this content while we waited.
                 row = conn.execute(
-                    "SELECT width, quality, taken_at, taken_at_source FROM photo_contents WHERE id = ?",
+                    """
+                    SELECT width, quality, taken_at, taken_at_source,
+                           lat, lon, gps, coord_source
+                    FROM photo_contents WHERE id = ?
+                    """,
                     (content_id,),
                 ).fetchone()
-                if row and (row["width"] is None or row["quality"] is None):
+                if row:
                     apply_date = can_replace_taken_at(
                         row["taken_at"],
                         row["taken_at_source"],
                         resolved,
                         taken_src,
                     )
-                    conn.execute(
+                    old_src = infer_coord_source(dict(row))
+                    apply_gps = has_gps and can_replace_coords(old_src, "exif")
+                    clear_place = False
+                    if apply_gps:
+                        same_gps = coords_close(
+                            row["lat"], row["lon"], meta.get("lat"), meta.get("lon")
+                        )
+                        clear_place = old_src != "exif" or not same_gps
+                    need_core = row["width"] is None or row["quality"] is None
+                    if need_core or apply_date or apply_gps:
+                        conn.execute(
                         """
                         UPDATE photo_contents SET
                             width=COALESCE(width, ?),
@@ -688,7 +1036,13 @@ def _index_source_files(
                             camera=COALESCE(camera, ?),
                             lat=CASE WHEN ? THEN ? ELSE lat END,
                             lon=CASE WHEN ? THEN ? ELSE lon END,
-                            gps=CASE WHEN ? THEN 1 ELSE gps END,
+                            gps=CASE WHEN ? THEN ? ELSE gps END,
+                            coord_source=CASE WHEN ? THEN 'exif' ELSE coord_source END,
+                            venue=CASE WHEN ? THEN NULL ELSE venue END,
+                            city=CASE WHEN ? THEN NULL ELSE city END,
+                            region=CASE WHEN ? THEN NULL ELSE region END,
+                            country=CASE WHEN ? THEN NULL ELSE country END,
+                            place_label=CASE WHEN ? THEN NULL ELSE place_label END,
                             sharpness=COALESCE(sharpness, ?),
                             exposure=COALESCE(exposure, ?),
                             quality=COALESCE(quality, ?)
@@ -702,11 +1056,18 @@ def _index_source_files(
                             1 if apply_date else 0,
                             taken_src,
                             meta["camera"],
-                            1 if has_gps else 0,
+                            1 if apply_gps else 0,
                             meta["lat"],
-                            1 if has_gps else 0,
+                            1 if apply_gps else 0,
                             meta["lon"],
-                            1 if has_gps else 0,
+                            1 if apply_gps else 0,
+                            gps_flag("exif") if apply_gps else 0,
+                            1 if apply_gps else 0,
+                            1 if clear_place else 0,
+                            1 if clear_place else 0,
+                            1 if clear_place else 0,
+                            1 if clear_place else 0,
+                            1 if clear_place else 0,
                             meta.get("sharpness"),
                             meta.get("exposure"),
                             meta.get("quality"),
@@ -755,7 +1116,7 @@ def _process_sources(
         phase="list",
         current=0,
         total=0,
-        message="Listing archives" if source_id is None else "Listing archive",
+        message="Listing library" if source_id is None else "Listing volume",
         error=None,
         reembed=reembed,
         source_id=source_id,
@@ -767,6 +1128,18 @@ def _process_sources(
     to_embed: list[tuple[int, Path]] = []
 
     for src in sources:
+        from fotoman import replica
+
+        if replica.wants_sync(src):
+            _set(
+                force_persist=True,
+                phase="sync",
+                current=0,
+                total=0,
+                message=f"Syncing {src['label']}",
+                source_id=int(src["id"]),
+            )
+            replica.sync_source(src)
         listing = _list_source(src)
         if listing.get("missing"):
             continue
@@ -791,6 +1164,17 @@ def _process_sources(
         found, embeds = _index_source_files(src, listing["to_index"])
         discovered += found
         to_embed.extend(embeds)
+        if found:
+            try:
+                from fotoman.collections import (
+                    invalidate_fotomob_share_cache,
+                    sync_linked_folder_trees,
+                )
+
+                invalidate_fotomob_share_cache()
+                sync_linked_folder_trees(source_id=int(src["id"]))
+            except Exception:
+                pass
 
         if reembed:
             # Force re-embed of all contents still linked from this archive.
@@ -808,8 +1192,9 @@ def _process_sources(
             have = {cid for cid, _ in to_embed}
             for r in rows:
                 cid = int(r["content_id"])
-                if cid not in have and Path(r["path"]).is_file():
-                    to_embed.append((cid, Path(r["path"])))
+                read_path = _readable_index_path(str(r["path"]), Path(r["path"]))
+                if cid not in have and read_path is not None:
+                    to_embed.append((cid, read_path))
                     have.add(cid)
 
         if _should_preempt() or _should_pause_heavy():
@@ -838,14 +1223,58 @@ def _scan_sources(
     return discovered, to_embed
 
 
+def _is_unusable_image_error(exc: BaseException) -> bool:
+    """True when the file itself cannot be decoded (retrying will not help)."""
+    from PIL import UnidentifiedImageError
+
+    if isinstance(exc, UnidentifiedImageError):
+        return True
+    msg = str(exc).lower()
+    return "cannot identify image file" in msg or "truncated" in msg
+
+
+def _mark_embed_unusable(content_ids: list[int]) -> None:
+    if not content_ids:
+        return
+    with db() as conn:
+        conn.executemany(
+            """
+            UPDATE photo_contents
+            SET embedding_ready = ?
+            WHERE id = ? AND embedding_ready = 0
+            """,
+            [(EMBED_UNUSABLE, int(cid)) for cid in content_ids],
+        )
+
+
+def _retry_unusable_embeds(source_id: int | None = None) -> None:
+    """Turn skipped-unreadable contents back into pending so Embed Go can retry."""
+    with db() as conn:
+        if source_id is None:
+            conn.execute(
+                "UPDATE photo_contents SET embedding_ready = 0 WHERE embedding_ready = ?",
+                (EMBED_UNUSABLE,),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE photo_contents
+                SET embedding_ready = 0
+                WHERE embedding_ready = ?
+                  AND id IN (SELECT content_id FROM photos WHERE source_id = ?)
+                """,
+                (EMBED_UNUSABLE, int(source_id)),
+            )
+
+
 def _embed_pending(
     to_embed: list[tuple[int, Path]],
     *,
     batch_size: int = 8,
-) -> list[tuple[int, Path]]:
-    """Embed contents. Returns any remaining items if preempted or suspended."""
+) -> tuple[list[tuple[int, Path]], int]:
+    """Embed contents. Returns (remaining if preempted/suspended, skipped count)."""
     if not to_embed:
-        return []
+        return [], 0
 
     # Deduplicate by content_id (first path wins).
     by_id: dict[int, Path] = {}
@@ -867,14 +1296,22 @@ def _embed_pending(
     for i in range(0, len(to_embed), batch_size):
         if _should_preempt() or _should_suspend_embed():
             store.save()
-            return to_embed[i:]
+            return to_embed[i:], skipped
 
         chunk = to_embed[i : i + batch_size]
+        resolved: list[tuple[int, Path]] = []
+        for cid, path in chunk:
+            read_path = _readable_index_path(str(path), Path(path))
+            if read_path is not None:
+                resolved.append((cid, read_path))
+        if not resolved:
+            done = min(i + batch_size, len(to_embed))
+            _set(current=done, persist=False)
+            continue
         ok_ids: list[int] = []
-        ok_paths: list[Path] = []
         try:
-            vecs = embed_images([p for _, p in chunk], batch_size=batch_size)
-            ok_ids = [cid for cid, _ in chunk]
+            vecs = embed_images([p for _, p in resolved], batch_size=batch_size)
+            ok_ids = [cid for cid, _ in resolved]
             store.add(ok_ids, vecs)
             store.save()
             with db() as conn:
@@ -888,10 +1325,10 @@ def _embed_pending(
                 )
         except Exception:
             # One bad file must not block the rest of the batch.
-            for cid, path in chunk:
+            for cid, path in resolved:
                 if _should_preempt() or _should_suspend_embed():
                     store.save()
-                    return [(cid, path)] + to_embed[i + batch_size :]
+                    return [(cid, path)] + to_embed[i + batch_size :], skipped
                 try:
                     vecs = embed_images([path], batch_size=1)
                     store.add([cid], vecs)
@@ -908,6 +1345,8 @@ def _embed_pending(
                     ok_ids.append(cid)
                 except Exception as e:
                     skipped += 1
+                    if _is_unusable_image_error(e):
+                        _mark_embed_unusable([cid])
                     _set(message=f"Embed skipped {path.name}: {e}", persist=False)
 
         done = min(i + batch_size, len(to_embed))
@@ -921,7 +1360,7 @@ def _embed_pending(
             force_persist=True,
         )
 
-    return []
+    return [], skipped
 
 
 def _reconcile_embedding_flags(source_id: int | None = None) -> None:
@@ -1125,23 +1564,25 @@ def _backfill_places_from_paths(source_id: int | None = None) -> None:
     """Fill empty place_label from directory names when GPS geocode did not."""
     params: tuple[Any, ...] = ()
     if source_id is not None:
-        sql = """
+        sql = f"""
             SELECT c.id, MIN(p.rel_path) AS rel_path
             FROM photo_contents c
             JOIN photos p ON p.content_id = c.id
             WHERE p.source_id = ?
               AND p.culled = 0 AND p.missing = 0
               AND (c.place_label IS NULL OR c.place_label = '')
+              AND c.id NOT IN ({_DEVICE_CONTENT_IDS_SQL})
             GROUP BY c.id
         """
         params = (source_id,)
     else:
-        sql = """
+        sql = f"""
             SELECT c.id, MIN(p.rel_path) AS rel_path
             FROM photo_contents c
             JOIN photos p ON p.content_id = c.id
             WHERE p.culled = 0 AND p.missing = 0
               AND (c.place_label IS NULL OR c.place_label = '')
+              AND c.id NOT IN ({_DEVICE_CONTENT_IDS_SQL})
             GROUP BY c.id
         """
     with db() as conn:
@@ -1177,7 +1618,7 @@ def _forward_geocode_folder_places(source_id: int | None = None) -> None:
     """Forward-geocode freeform place_labels (folder-derived) into structured fields + coords."""
     params: tuple[Any, ...] = ()
     if source_id is not None:
-        sql = """
+        sql = f"""
             SELECT DISTINCT c.place_label
             FROM photo_contents c
             JOIN photos p ON p.content_id = c.id
@@ -1185,14 +1626,16 @@ def _forward_geocode_folder_places(source_id: int | None = None) -> None:
               AND c.place_label IS NOT NULL AND c.place_label != ''
               AND (c.country IS NULL OR c.country = '')
               AND c.lat IS NULL
+              AND c.id NOT IN ({_DEVICE_CONTENT_IDS_SQL})
         """
         params = (source_id,)
     else:
-        sql = """
+        sql = f"""
             SELECT DISTINCT place_label FROM photo_contents
             WHERE place_label IS NOT NULL AND place_label != ''
               AND (country IS NULL OR country = '')
               AND lat IS NULL
+              AND id NOT IN ({_DEVICE_CONTENT_IDS_SQL})
         """
     with db() as conn:
         rows = conn.execute(sql, params).fetchall()
@@ -1219,12 +1662,13 @@ def _forward_geocode_folder_places(source_id: int | None = None) -> None:
             if coords:
                 with db() as conn:
                     conn.execute(
-                        """
+                        f"""
                         UPDATE photo_contents
                         SET venue = ?, city = ?, region = ?, country = ?, place_label = ?,
-                            lat = ?, lon = ?, gps = 0
+                            lat = ?, lon = ?, gps = 0, coord_source = 'geocode'
                         WHERE place_label = ? AND (country IS NULL OR country = '')
-                          AND lat IS NULL AND IFNULL(gps, 0) = 0
+                          AND lat IS NULL AND IFNULL(coord_source, '') NOT IN ('exif', 'manual')
+                          AND id NOT IN ({_DEVICE_CONTENT_IDS_SQL})
                         """,
                         (
                             place.get("venue"),
@@ -1240,10 +1684,11 @@ def _forward_geocode_folder_places(source_id: int | None = None) -> None:
             elif place.get("country"):
                 with db() as conn:
                     conn.execute(
-                        """
+                        f"""
                         UPDATE photo_contents
                         SET venue = ?, city = ?, region = ?, country = ?, place_label = ?
                         WHERE place_label = ? AND (country IS NULL OR country = '') AND lat IS NULL
+                          AND id NOT IN ({_DEVICE_CONTENT_IDS_SQL})
                         """,
                         (
                             place.get("venue"),
@@ -1469,6 +1914,8 @@ def scan_and_embed(
     parked_embed_jobs: deque[dict[str, Any]] = deque()
     discovered_total = 0
     embedded_total = 0
+    skipped_embed = 0
+    attempted_embed_ids: set[int] = set()
     listed_only = True
     ran_backfill = False
 
@@ -1494,6 +1941,7 @@ def scan_and_embed(
                     embed_sid = job.get("source_id")
                     if embed_sid is not None:
                         _set(source_id=embed_sid, force_persist=True)
+                    _retry_unusable_embeds(embed_sid)
                     deferred_embed.extend(_pending_embed_items(embed_sid))
                 else:
                     sid = job.get("source_id")
@@ -1503,7 +1951,14 @@ def scan_and_embed(
                         source_id=sid,
                     )
                     discovered_total += discovered
-                    if discovered or to_embed or job_mode in ("scan", "index"):
+                    if discovered:
+                        try:
+                            from fotoman import backup
+
+                            backup.schedule_pending()
+                        except Exception:
+                            pass
+                    if discovered or to_embed:
                         listed_only = False
                     # Do not auto-embed after list/index — wait for user Go.
                     if interrupted:
@@ -1535,6 +1990,11 @@ def scan_and_embed(
                 continue
 
             # Geocode must finish before embeds (parked jobs released after).
+            # Skip the library-wide backfill when listing found nothing to index
+            # (e.g. collection export already hash-linked).
+            if not jobs and not ran_backfill and listed_only:
+                ran_backfill = True
+                continue
             if not jobs and not ran_backfill and not _should_pause_heavy():
                 _backfill_taken_at()
                 if _should_preempt():
@@ -1650,10 +2110,12 @@ def scan_and_embed(
             if deferred_embed:
                 listed_only = False
                 before = len(deferred_embed)
-                deferred_embed = _embed_pending(
+                attempted_embed_ids.update(cid for cid, _ in deferred_embed)
+                deferred_embed, skipped_n = _embed_pending(
                     deferred_embed, batch_size=batch_size
                 )
-                embedded_total += before - len(deferred_embed)
+                skipped_embed += skipped_n
+                embedded_total += max(0, before - len(deferred_embed) - skipped_n)
                 if deferred_embed:
                     if _should_preempt():
                         continue
@@ -1682,6 +2144,8 @@ def scan_and_embed(
                         f"Indexed. New/updated: {discovered_total}, "
                         f"embedded: {embedded_total}"
                     )
+                    if skipped_embed:
+                        snap_message += f", {skipped_embed} unreadable"
             # Pending embeds: run them unless the user paused Embed.
             waiting = count_pending_embeds()
             if waiting > 0:
@@ -1691,13 +2155,22 @@ def scan_and_embed(
                         message=f"Paused — {waiting} contents waiting to embed.",
                         embed_suspended=True,
                     )
-                deferred_embed.extend(_pending_embed_items(None))
+                more = [
+                    item
+                    for item in _pending_embed_items(None)
+                    if item[0] not in attempted_embed_ids
+                ]
+                deferred_embed.extend(more)
                 if deferred_embed:
                     continue
                 return _finish_idle(
-                    phase="suspended",
-                    message=f"Paused — {waiting} contents waiting to embed.",
-                    embed_suspended=True,
+                    phase="done",
+                    message=(
+                        f"{snap_message} {waiting} could not be embedded."
+                        if skipped_embed or attempted_embed_ids
+                        else f"Paused — {waiting} contents waiting to embed."
+                    ),
+                    embed_suspended=False,
                 )
             # Catch up clustering even when no new embeds this wave (migration / crash).
             if not _compute_clustering():
@@ -1713,7 +2186,11 @@ def scan_and_embed(
 def enabled_source_ids() -> list[int]:
     with db() as conn:
         rows = conn.execute(
-            "SELECT id FROM sources WHERE enabled = 1 ORDER BY id"
+            """
+            SELECT id FROM sources
+            WHERE enabled = 1 AND IFNULL(kind, 'watched') != 'backup'
+            ORDER BY id
+            """
         ).fetchall()
     return [int(r["id"]) for r in rows]
 
@@ -1911,6 +2388,7 @@ def resume_embedding(source_id: int | None = None) -> dict[str, Any]:
             # A list/index may be in progress; embedding can be queued after.
             pass
 
+    _retry_unusable_embeds(source_id)
     pending = count_pending_embeds(source_id)
     if pending > 0:
         start_index_background(source_id=source_id, mode="embed", high_priority=False)
@@ -2043,11 +2521,30 @@ def unscanned_source_ids() -> list[int]:
             """
             SELECT id, path FROM sources
             WHERE enabled = 1 AND scanned_at IS NULL
+              AND IFNULL(kind, 'watched') != 'backup'
             ORDER BY id
             """
         ).fetchall()
     # Skip missing mounts so we don't busy-loop empty scan jobs.
-    return [int(r["id"]) for r in rows if Path(r["path"]).exists()]
+    from fotoman import device
+
+    return [
+        int(r["id"])
+        for r in rows
+        if device.source_exists(dict(r)) and int(r["id"]) not in _importing_source_ids()
+    ]
+
+
+def _importing_source_ids() -> set[int]:
+    try:
+        from fotoman.reclaim_import import get_status
+
+        st = get_status()
+        if st.get("running") and st.get("source_id") is not None:
+            return {int(st["source_id"])}
+    except Exception:
+        pass
+    return set()
 
 
 

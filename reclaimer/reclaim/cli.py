@@ -25,7 +25,9 @@ app = typer.Typer(
     help="Get media off Google / Facebook / Instagram onto disk for Fotoman.",
     no_args_is_help=True,
 )
-google_app = typer.Typer(help="Google Photos API pull and Takeout assist.")
+google_app = typer.Typer(
+    help="Google Photos via Takeout (preferred). Legacy Library API pull is limited."
+)
 app.add_typer(google_app, name="google")
 facebook_app = typer.Typer(help="Facebook Download Your Information assist.")
 app.add_typer(facebook_app, name="facebook")
@@ -122,15 +124,19 @@ def google_auth(
         help=f"OAuth desktop client JSON (default: {client_secrets_path()})",
     ),
 ) -> None:
-    """OAuth browser flow; store refresh token under ~/.config/reclaim/."""
+    """Legacy OAuth for Library API (cannot read your full library after Mar 2025)."""
     from reclaim.google_auth import run_auth
 
+    console.print(
+        "[yellow]Note:[/yellow] Google no longer allows library-wide Photos download "
+        "via API. Prefer [cyan]reclaim google takeout[/cyan] (no OAuth)."
+    )
     _exit(run_auth(client_secrets))
 
 
 @google_app.command("logout")
 def google_logout() -> None:
-    """Delete stored Google refresh token."""
+    """Delete stored Google refresh token (legacy API path)."""
     from reclaim.google_auth import logout
 
     _exit(logout())
@@ -145,9 +151,23 @@ def google_pull(
     no_videos: bool = typer.Option(False, "--no-videos", help="Skip videos"),
     dedup: str = typer.Option("hardlink", "--dedup", help="skip|hardlink|symlink"),
     layout: str = typer.Option("albums", "--layout", help="albums|date|flat"),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Proceed despite library-read being unavailable for existing Photos",
+    ),
 ) -> None:
-    """Download Google Photos library via API (resume-friendly)."""
+    """Legacy Library API pull — cannot download your existing Photos library."""
     from reclaim.google_pull import pull
+
+    console.print(
+        "[bold yellow]Google Photos Library API cannot read your existing library "
+        "(policy change 31 Mar 2025).[/bold yellow]\n"
+        "Use [cyan]reclaim google takeout -o OUT[/cyan] instead."
+    )
+    if not force:
+        console.print("Pass [cyan]--force[/cyan] only to experiment with the legacy API.")
+        _exit(ExitCode.USAGE)
 
     since_dt: datetime | None = None
     if since:
@@ -189,7 +209,7 @@ def google_takeout(
     layout: str = typer.Option("albums", "--layout"),
     no_open: bool = typer.Option(False, "--no-open", help="Do not open browser"),
 ) -> None:
-    """Assist Google Takeout for Photos, watch for zips, normalize."""
+    """Preferred: open Takeout, watch for Photos zip(s), normalize into -o."""
     _run_fetch_wizard(
         "google_takeout",
         out,

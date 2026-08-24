@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import tempfile
@@ -234,6 +235,20 @@ def _instagram_album(rel: Path) -> str | None:
     return None
 
 
+def _album_and_date(rel: Path, source: str, media: Path | None = None) -> tuple[str | None, str | None]:
+    album: str | None = None
+    date_prefix: str | None = None
+    if source in (SOURCE_GOOGLE_TAKEOUT, SOURCE_GOOGLE_PHOTOS):
+        album = _album_from_takeout_path(rel)
+        if media is not None:
+            date_prefix = _date_from_sidecar(media)
+    elif source == SOURCE_FACEBOOK:
+        album = _facebook_album(rel)
+    elif source == SOURCE_INSTAGRAM:
+        album = _instagram_album(rel)
+    return album, date_prefix
+
+
 def _iter_media_from_dir(
     root: Path,
     source: str,
@@ -250,24 +265,108 @@ def _iter_media_from_dir(
             rel = p.relative_to(root)
         except ValueError:
             rel = Path(p.name)
-        album: str | None = None
-        date_prefix: str | None = None
-        if source in (SOURCE_GOOGLE_TAKEOUT, SOURCE_GOOGLE_PHOTOS):
-            album = _album_from_takeout_path(rel)
-            date_prefix = _date_from_sidecar(p)
-        elif source == SOURCE_FACEBOOK:
-            album = _facebook_album(rel)
-        elif source == SOURCE_INSTAGRAM:
-            album = _instagram_album(rel)
+        album, date_prefix = _album_and_date(rel, source, p)
         items.append((p, album, date_prefix))
     return items
 
 
-def _extract_zips(zips: list[Path], dest: Path) -> None:
-    dest.mkdir(parents=True, exist_ok=True)
+def _zip_rel(name: str) -> Path | None:
+    rel = Path(name.replace("\\", "/"))
+    if rel.is_absolute() or any(part == ".." for part in rel.parts):
+        return None
+    if rel.name.startswith(".") or "__MACOSX" in rel.parts:
+        return None
+    return rel
+
+
+def _place_media_from_zips(
+    zips: list[Path],
+    *,
+    source: str,
+    store: ManifestStore,
+    layout: Layout,
+    dedup: DedupMode,
+    stats: RunStats,
+    log: Callable[[str], None],
+) -> set[str]:
+    """Copy only media members (one file at a time). Never extractall."""
+    albums_seen: set[str] = set()
     for zpath in zips:
         with zipfile.ZipFile(zpath) as zf:
-            zf.extractall(dest)
+            members: list[tuple[zipfile.ZipInfo, Path]] = []
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                rel = _zip_rel(info.filename)
+                if rel is None or not is_media(rel):
+                    continue
+                members.append((info, rel))
+            log(f"{zpath.name}: {len(members)} media file(s)")
+            for i, (info, rel) in enumerate(members, 1):
+                album, date_prefix = _album_and_date(rel, source)
+                if album:
+                    albums_seen.add(album)
+                if i == 1 or i % 20 == 0 or i == len(members):
+                    log(f"unpack {i}/{len(members)} {rel.name}")
+                tmp_path: Path | None = None
+                try:
+                    with zf.open(info) as src_f:
+                        fd, tmp_name = tempfile.mkstemp(suffix=rel.suffix)
+                        tmp_path = Path(tmp_name)
+                        with os.fdopen(fd, "wb") as out_f:
+                            shutil.copyfileobj(src_f, out_f, length=1024 * 1024)
+                    result = place_file(
+                        tmp_path,
+                        store=store,
+                        source=source,
+                        layout=layout,
+                        dedup=dedup,
+                        album=album,
+                        date_prefix=date_prefix,
+                        original_name=rel.name,
+                    )
+                    apply_place_to_stats(stats, result)
+                except (OSError, zipfile.BadZipFile) as e:
+                    stats.errors += 1
+                    log(f"error: {rel.name}: {e}")
+                finally:
+                    if tmp_path is not None:
+                        tmp_path.unlink(missing_ok=True)
+    return albums_seen
+
+
+def _place_media_from_dir(
+    work_root: Path,
+    *,
+    source: str,
+    store: ManifestStore,
+    layout: Layout,
+    dedup: DedupMode,
+    stats: RunStats,
+    log: Callable[[str], None],
+) -> set[str]:
+    items = _iter_media_from_dir(work_root, source)
+    log(f"found {len(items)} media file(s); placing into {store.out}…")
+    albums_seen: set[str] = set()
+    for media_path, album, date_prefix in items:
+        if album:
+            albums_seen.add(album)
+        try:
+            result = place_file(
+                media_path,
+                store=store,
+                source=source,
+                layout=layout,
+                dedup=dedup,
+                album=album,
+                date_prefix=date_prefix,
+                original_name=media_path.name,
+            )
+            apply_place_to_stats(stats, result)
+        except OSError as e:
+            stats.errors += 1
+            log(f"error: {media_path.name}: {e}")
+    return albums_seen
 
 
 def normalize(
@@ -291,84 +390,65 @@ def normalize(
 
     report = inspect_input(input_path)
     src = source or report.source_guess or SOURCE_GOOGLE_TAKEOUT
-    # normalize alias
-    if src == SOURCE_GOOGLE_PHOTOS:
-        # keep under google_photos for API pulls; takeout uses google_takeout
-        pass
 
-    work_root: Path | None = None
-    cleanup: Path | None = None
-
+    albums_seen: set[str] = set()
     try:
         if input_path.is_file() and input_path.suffix.lower() == ".zip":
             parts = find_multipart_zips(input_path)
-            log(f"extracting {len(parts)} zip part(s)…")
-            cleanup = Path(tempfile.mkdtemp(prefix="reclaim-norm-"))
-            try:
-                _extract_zips(parts, cleanup)
-            except zipfile.BadZipFile as e:
-                log(f"bad zip: {e}")
-                return stats, ExitCode.FATAL_IO
-            work_root = cleanup
-            # If single Takeout/ folder, descend
-            children = [c for c in cleanup.iterdir() if not c.name.startswith(".")]
-            if len(children) == 1 and children[0].is_dir():
-                work_root = children[0]
+            log(f"reading {len(parts)} zip part(s)…")
+            albums_seen = _place_media_from_zips(
+                parts,
+                source=src,
+                store=store,
+                layout=layout,
+                dedup=dedup,
+                stats=stats,
+                log=log,
+            )
         elif input_path.is_dir():
-            zips = [p for p in input_path.iterdir() if p.suffix.lower() == ".zip"]
+            zips = sorted(
+                p for p in input_path.iterdir() if p.is_file() and p.suffix.lower() == ".zip"
+            )
             if zips and not any(is_media(p) for p in input_path.rglob("*") if p.is_file()):
-                log(f"extracting {len(zips)} zip(s) from directory…")
-                cleanup = Path(tempfile.mkdtemp(prefix="reclaim-norm-"))
-                _extract_zips(sorted(zips), cleanup)
-                work_root = cleanup
-                children = [c for c in cleanup.iterdir() if not c.name.startswith(".")]
-                if len(children) == 1 and children[0].is_dir():
-                    work_root = children[0]
+                log(f"reading {len(zips)} zip(s) from directory…")
+                albums_seen = _place_media_from_zips(
+                    zips,
+                    source=src,
+                    store=store,
+                    layout=layout,
+                    dedup=dedup,
+                    stats=stats,
+                    log=log,
+                )
             else:
-                work_root = input_path
+                albums_seen = _place_media_from_dir(
+                    input_path,
+                    source=src,
+                    store=store,
+                    layout=layout,
+                    dedup=dedup,
+                    stats=stats,
+                    log=log,
+                )
         else:
             log(f"unsupported input: {input_path}")
             return stats, ExitCode.USAGE
+    except zipfile.BadZipFile as e:
+        log(f"bad zip: {e}")
+        return stats, ExitCode.FATAL_IO
 
-        assert work_root is not None
-        items = _iter_media_from_dir(work_root, src)
-        log(f"found {len(items)} media file(s); placing into {out}…")
-        albums_seen: set[str] = set()
-
-        for media_path, album, date_prefix in items:
-            if album:
-                albums_seen.add(album)
-            try:
-                result = place_file(
-                    media_path,
-                    store=store,
-                    source=src,
-                    layout=layout,
-                    dedup=dedup,
-                    album=album,
-                    date_prefix=date_prefix,
-                    original_name=media_path.name,
-                )
-                apply_place_to_stats(stats, result)
-            except OSError as e:
-                stats.errors += 1
-                log(f"error: {media_path.name}: {e}")
-
-        stats.albums = len(albums_seen)
-        code = ExitCode.OK if stats.errors == 0 else ExitCode.PARTIAL
-        store.write_run(
-            RunRecord(
-                command="normalize",
-                source=src,
-                started_at=started,
-                finished_at=now(),
-                output=str(out),
-                stats=stats.__dict__.copy(),
-                ok=code == ExitCode.OK,
-                message=f"{stats.extracted} extracted, {stats.hardlinked_exact} hardlinked, {stats.skipped_existing} skipped",
-            )
+    stats.albums = len(albums_seen)
+    code = ExitCode.OK if stats.errors == 0 else ExitCode.PARTIAL
+    store.write_run(
+        RunRecord(
+            command="normalize",
+            source=src,
+            started_at=started,
+            finished_at=now(),
+            output=str(out),
+            stats=stats.__dict__.copy(),
+            ok=code == ExitCode.OK,
+            message=f"{stats.extracted} extracted, {stats.hardlinked_exact} hardlinked, {stats.skipped_existing} skipped",
         )
-        return stats, code
-    finally:
-        if cleanup and cleanup.exists():
-            shutil.rmtree(cleanup, ignore_errors=True)
+    )
+    return stats, code

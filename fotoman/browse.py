@@ -1,7 +1,8 @@
 """Browse views: folder tree, date tree, location tree, metadata groupings, and similarity clusters.
 
-Folder and date views read enabled sources from the filesystem (no index required).
-Camera / location / album / clusters still use the indexed photos table.
+Folder view scans mounted archives on disk and falls back to the index when a
+drive is unplugged (offline). Date view still reads enabled sources from the
+filesystem. Camera / location / album / clusters use the indexed photos table.
 Location tree nests countries under continents from countries.json.
 """
 
@@ -13,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from fotoman.aspect import ASPECT_CLASS_SQL, ASPECT_CLASSES, ASPECT_LABELS
 from fotoman.config import IMAGE_EXTS, ROOT, THUMBS_DIR
 from fotoman.db import PHOTO_SELECT, db
 from fotoman.metadata import make_thumbnail
@@ -65,15 +67,20 @@ def _sources(source_id: int | None = None) -> list[dict[str, Any]]:
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT * FROM sources WHERE enabled = 1 ORDER BY id"
+                """
+                SELECT * FROM sources
+                WHERE enabled = 1 AND IFNULL(kind, 'watched') != 'backup'
+                ORDER BY id
+                """
             ).fetchall()
     return [dict(r) for r in rows]
 
 
 def _culled_sql(include_culled: bool, alias: str = "") -> str:
+    from fotoman.device import vault_live_sql_subquery
+
     col = f"{alias}.culled" if alias else "culled"
-    miss = f"{alias}.missing" if alias else "missing"
-    live = f"{miss} = 0"
+    live = vault_live_sql_subquery(alias or "p")
     if include_culled:
         return live
     return f"{col} = 0 AND {live}"
@@ -103,23 +110,20 @@ def resolve_source_file(source_id: int, rel: str) -> Path:
     """Resolve a relative path under a source; raises ValueError if invalid."""
     with db() as conn:
         row = conn.execute(
-            "SELECT path FROM sources WHERE id = ?", (source_id,)
+            "SELECT * FROM sources WHERE id = ?", (source_id,)
         ).fetchone()
     if not row:
         raise ValueError("Source not found")
-    root = Path(row["path"]).expanduser().resolve()
-    # Normalize rel: strip leading slashes, reject traversal
     rel_path = Path(rel)
     if rel_path.is_absolute() or ".." in rel_path.parts:
         raise ValueError("Invalid path")
-    full = (root / rel_path).resolve()
-    try:
-        full.relative_to(root)
-    except ValueError as e:
-        raise ValueError("Path outside source") from e
-    if not full.is_file() or full.suffix.lower() not in IMAGE_EXTS:
+    from fotoman import replica
+
+    src = dict(row)
+    found = replica.readable_file(src, rel)
+    if found is None or not found.is_file() or found.suffix.lower() not in IMAGE_EXTS:
         raise ValueError("Not an image file")
-    return full
+    return found
 
 
 def browse_thumb_file(source_id: int, rel: str) -> Path:
@@ -149,9 +153,21 @@ def _rel_of(root: Path, path: Path) -> str:
     return path.relative_to(root).as_posix()
 
 
-def _date_for_file(path: Path, indexed: dict[str, str]) -> str | None:
+def _walk_root(src: dict[str, Any]) -> Path | None:
+    from fotoman import replica
+
+    return replica.live_root(src)
+
+
+def _canonical_path(src: dict[str, Any], walked: Path, path: Path) -> str:
+    return str(Path(src["path"]).expanduser() / _rel_of(walked, path))
+
+
+def _date_for_file(
+    path: Path, indexed: dict[str, str], canonical: str | None = None
+) -> str | None:
     """Prefer indexed EXIF date; otherwise file mtime. No on-the-fly EXIF."""
-    taken = indexed.get(str(path))
+    taken = (indexed.get(canonical) if canonical else None) or indexed.get(str(path))
     if taken:
         return taken
     try:
@@ -205,9 +221,42 @@ def _enrich_from_db(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
             item["lon"] = row["lon"]
         if row.get("orientation") is not None:
             item["orientation"] = int(row["orientation"] or 0)
+        if row.get("aspect_class"):
+            item["aspect_class"] = row["aspect_class"]
         if row.get("mirrored"):
             item["mirrored"] = True
     return items
+
+
+def _empty_folder_node() -> dict[str, Any]:
+    return {"__count": 0, "__direct": 0, "__children": {}, "__files": []}
+
+
+def _add_rel_to_folder_node(src_node: dict[str, Any], rel: str) -> None:
+    parts = Path(str(rel).replace("\\", "/")).parts
+    if not parts:
+        return
+    node = src_node
+    for seg in parts[:-1]:
+        node["__count"] += 1
+        node = node["__children"].setdefault(seg, _empty_folder_node())
+    node["__count"] += 1
+    node["__direct"] = node.get("__direct", 0) + 1
+
+
+def _fill_folder_node_from_db(
+    src_node: dict[str, Any], source_id: int, include_culled: bool
+) -> None:
+    culled = "1=1" if include_culled else "culled = 0"
+    with db() as conn:
+        rows = conn.execute(
+            f"SELECT rel_path FROM photos WHERE source_id = ? AND {culled}",
+            (int(source_id),),
+        ).fetchall()
+    for r in rows:
+        rel = (r["rel_path"] or "").strip()
+        if rel:
+            _add_rel_to_folder_node(src_node, rel)
 
 
 def folder_tree(
@@ -215,35 +264,38 @@ def folder_tree(
     include_files: bool = False,
     include_culled: bool = False,
 ) -> list[dict[str, Any]]:
-    """Return nested folder structure by scanning source directories on disk.
+    """Nested folder structure per archive.
 
-    ``include_files`` is unused (tree never lists individual images); kept for
-    API compatibility. Removed photos are omitted unless ``include_culled``.
+    Mounted archives scan the disk (works before index). Unmounted archives
+    keep their last indexed tree and are marked ``offline``.
     """
     tree: dict[str, Any] = {}
-    # label -> source_id (first wins if duplicate labels)
     label_ids: dict[str, int] = {}
     skip = set() if include_culled else _removed_paths()
 
+    from fotoman import replica
+
     for src in _sources(source_id):
-        root = Path(src["path"]).expanduser().resolve()
+        root = Path(src["path"]).expanduser()
         label = src["label"] or root.name or str(root)
         label_ids[label] = src["id"]
-        src_node = tree.setdefault(
-            label, {"__count": 0, "__direct": 0, "__children": {}, "__files": []}
-        )
-        if not root.exists():
+        src_node = tree.setdefault(label, _empty_folder_node())
+        walked = replica.live_root(src)
+        if walked is None:
+            src_node["__offline"] = not replica.source_exists(src)
+            _fill_folder_node_from_db(src_node, int(src["id"]), include_culled)
             continue
-        for path in _iter_images(root):
-            if str(path) in skip:
+        src_node["__offline"] = False
+        walked = walked.resolve()
+        for path in _iter_images(walked):
+            canonical = _canonical_path(src, walked, path)
+            if canonical in skip or str(path) in skip:
                 continue
-            parts = Path(_rel_of(root, path)).parts
+            parts = Path(_rel_of(walked, path)).parts
             node = src_node
             for seg in parts[:-1]:
                 node["__count"] += 1
-                node = node["__children"].setdefault(
-                    seg, {"__count": 0, "__direct": 0, "__children": {}, "__files": []}
-                )
+                node = node["__children"].setdefault(seg, _empty_folder_node())
             node["__count"] += 1
             node["__direct"] = node.get("__direct", 0) + 1
             if include_files:
@@ -258,13 +310,15 @@ def _serialize_tree(
     result = []
     for name, data in sorted(tree.items()):
         sid = label_ids[name]
+        offline = bool(data.get("__offline"))
         entry: dict[str, Any] = {
             "name": name,
             "path": f"{sid}:",
             "count": data["__count"],
             "direct_count": data.get("__direct", 0),
+            "offline": offline,
         }
-        children = _serialize_subtree(data, sid, "")
+        children = _serialize_subtree(data, sid, "", offline=offline)
         if children:
             entry["children"] = children
         result.append(entry)
@@ -272,7 +326,7 @@ def _serialize_tree(
 
 
 def _serialize_subtree(
-    data: dict[str, Any], source_id: int, prefix: str
+    data: dict[str, Any], source_id: int, prefix: str, *, offline: bool = False
 ) -> list[dict[str, Any]]:
     result = []
     for name, child in sorted(data.get("__children", {}).items()):
@@ -282,8 +336,9 @@ def _serialize_subtree(
             "path": f"{source_id}:{rel}",
             "count": child["__count"],
             "direct_count": child.get("__direct", 0),
+            "offline": offline,
         }
-        kids = _serialize_subtree(child, source_id, rel)
+        kids = _serialize_subtree(child, source_id, rel, offline=offline)
         if kids:
             entry["children"] = kids
         result.append(entry)
@@ -295,6 +350,7 @@ def _serialize_subtree(
             "count": 1,
             "direct_count": 1,
             "is_file": True,
+            "offline": offline,
         })
     return result
 
@@ -304,6 +360,44 @@ def _parse_folder_key(key: str) -> tuple[int, str]:
         raise ValueError("Invalid folder key")
     sid_s, _, rel = key.partition(":")
     return int(sid_s), rel
+
+
+def _db_photos_in_folder(
+    source_id: int,
+    rel: str,
+    limit: int,
+    include_culled: bool = False,
+    include_subfolders: bool = True,
+) -> list[dict[str, Any]]:
+    """Indexed locations for an archive folder, including missing/offline copies."""
+    live = "1=1" if include_culled else "p.culled = 0"
+    rel = str(rel or "").replace("\\", "/").strip("/")
+    clauses = [f"p.source_id = ?", live]
+    params: list[Any] = [int(source_id)]
+    if not rel:
+        if not include_subfolders:
+            clauses.append("instr(replace(p.rel_path, '\\', '/'), '/') = 0")
+    else:
+        prefix = rel + "/"
+        if include_subfolders:
+            clauses.append("replace(p.rel_path, '\\', '/') LIKE ?")
+            params.append(prefix.replace("%", "\\%") + "%")
+        else:
+            clauses.append(
+                "replace(p.rel_path, '\\', '/') LIKE ? "
+                "AND instr(substr(replace(p.rel_path, '\\', '/'), ?), '/') = 0"
+            )
+            params.extend([prefix.replace("%", "\\%") + "%", len(prefix) + 1])
+    where = " AND ".join(clauses)
+    with db() as conn:
+        rows = conn.execute(
+            f"""{PHOTO_SELECT}
+               WHERE {where}
+               ORDER BY COALESCE(c.taken_at, '') DESC, p.id DESC
+               LIMIT ?""",
+            [*params, int(limit)],
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def _fs_photos_in_folder(
@@ -319,22 +413,46 @@ def _fs_photos_in_folder(
         ).fetchone()
     if not row:
         return []
-    root = Path(row["path"]).expanduser().resolve()
+    from fotoman import replica
+
+    src = dict(row)
+    walked = replica.live_root(src)
+    if walked is None:
+        return _db_photos_in_folder(
+            source_id,
+            rel,
+            limit,
+            include_culled=include_culled,
+            include_subfolders=include_subfolders,
+        )
+    root = Path(row["path"]).expanduser()
     source_label = row["label"] or root.name or str(root)
-    base = (root / rel).resolve() if rel else root
+    walked = walked.resolve()
+    base = (walked / rel).resolve() if rel else walked
     try:
-        base.relative_to(root)
+        base.relative_to(walked)
     except ValueError:
         return []
     if not base.exists():
-        return []
+        return _db_photos_in_folder(
+            source_id,
+            rel,
+            limit,
+            include_culled=include_culled,
+            include_subfolders=include_subfolders,
+        )
 
     skip = set() if include_culled else _removed_paths()
 
     if base.is_file():
         if base.suffix.lower() not in IMAGE_EXTS:
             return []
-        if str(base) in skip:
+        try:
+            file_rel = _rel_of(walked, base)
+            canonical = str(root / file_rel)
+        except ValueError:
+            return []
+        if canonical in skip or str(base) in skip:
             return []
         try:
             mtime = base.stat().st_mtime
@@ -344,8 +462,8 @@ def _fs_photos_in_folder(
             "id": None,
             "source_id": source_id,
             "source_label": source_label,
-            "path": str(base),
-            "rel_path": _rel_of(root, base),
+            "path": canonical,
+            "rel_path": file_rel,
             "taken_at": datetime.fromtimestamp(mtime).isoformat(sep=" "),
         }])
 
@@ -354,18 +472,19 @@ def _fs_photos_in_folder(
 
     items: list[dict[str, Any]] = []
     for path in _iter_images(base, recursive=include_subfolders):
-        if str(path) in skip:
-            continue
         try:
-            file_rel = _rel_of(root, path)
+            file_rel = _rel_of(walked, path)
+            canonical = str(root / file_rel)
             mtime = path.stat().st_mtime
         except (ValueError, OSError):
+            continue
+        if canonical in skip or str(path) in skip:
             continue
         items.append({
             "id": None,
             "source_id": source_id,
             "source_label": source_label,
-            "path": str(path),
+            "path": canonical,
             "rel_path": file_rel,
             "taken_at": datetime.fromtimestamp(mtime).isoformat(sep=" "),
             "_mtime": mtime,
@@ -408,23 +527,45 @@ def date_tree(
     skip = set() if include_culled else _removed_paths()
     # year -> {__count, __children: month -> {__count, __children: day -> {__count}}}
     tree: dict[str, Any] = {}
+
+    def add_taken(taken: str | None) -> None:
+        if not taken or len(taken) < 10:
+            return
+        year, month, day = taken[:4], taken[5:7], taken[8:10]
+        y_node = tree.setdefault(year, {"__count": 0, "__children": {}})
+        y_node["__count"] += 1
+        m_node = y_node["__children"].setdefault(
+            month, {"__count": 0, "__children": {}}
+        )
+        m_node["__count"] += 1
+        d_node = m_node["__children"].setdefault(day, {"__count": 0})
+        d_node["__count"] += 1
+
     for src in _sources():
-        root = Path(src["path"]).expanduser().resolve()
-        for path in _iter_images(root):
-            if str(path) in skip:
+        if _walk_root(src) is None:
+            with db() as conn:
+                rows = conn.execute(
+                    f"""
+                    SELECT c.taken_at
+                    FROM photos p
+                    JOIN photo_contents c ON c.id = p.content_id
+                    WHERE p.source_id = ?
+                      AND {_culled_sql(include_culled, "p")}
+                      AND c.taken_at IS NOT NULL AND c.taken_at != ''
+                    """,
+                    (int(src["id"]),),
+                ).fetchall()
+            for r in rows:
+                add_taken(r["taken_at"])
+            continue
+        walked = _walk_root(src)
+        assert walked is not None
+        walked = walked.resolve()
+        for path in _iter_images(walked):
+            canonical = _canonical_path(src, walked, path)
+            if canonical in skip or str(path) in skip:
                 continue
-            taken = _date_for_file(path, indexed)
-            if not taken or len(taken) < 10:
-                continue
-            year, month, day = taken[:4], taken[5:7], taken[8:10]
-            y_node = tree.setdefault(year, {"__count": 0, "__children": {}})
-            y_node["__count"] += 1
-            m_node = y_node["__children"].setdefault(
-                month, {"__count": 0, "__children": {}}
-            )
-            m_node["__count"] += 1
-            d_node = m_node["__children"].setdefault(day, {"__count": 0})
-            d_node["__count"] += 1
+            add_taken(_date_for_file(path, indexed, canonical))
 
     reverse = bool(newest_first)
     result: list[dict[str, Any]] = []
@@ -468,14 +609,41 @@ def date_tree(
     return result
 
 
+def _db_dated_photos(
+    source_id: int, include_culled: bool = False
+) -> list[dict[str, Any]]:
+    with db() as conn:
+        rows = conn.execute(
+            f"""
+            {PHOTO_SELECT}
+            WHERE p.source_id = ?
+              AND {_culled_sql(include_culled, "p")}
+              AND c.taken_at IS NOT NULL AND c.taken_at != ''
+            ORDER BY c.taken_at DESC, p.id DESC
+            """,
+            (int(source_id),),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def _date_groups_from_fs() -> list[dict[str, Any]]:
     """Flat YYYY-MM list (kept for /api/browse/groups?group_by=date)."""
     indexed = _indexed_taken_at()
     counts: dict[str, int] = {}
     for src in _sources():
-        root = Path(src["path"]).expanduser().resolve()
-        for path in _iter_images(root):
-            taken = _date_for_file(path, indexed)
+        if _walk_root(src) is None:
+            for row in _db_dated_photos(int(src["id"])):
+                taken = str(row.get("taken_at") or "")
+                if len(taken) >= 7:
+                    month = taken[:7]
+                    counts[month] = counts.get(month, 0) + 1
+            continue
+        walked = _walk_root(src)
+        assert walked is not None
+        walked = walked.resolve()
+        for path in _iter_images(walked):
+            canonical = _canonical_path(src, walked, path)
+            taken = _date_for_file(path, indexed, canonical)
             if not taken or len(taken) < 7:
                 continue
             month = taken[:7]
@@ -506,11 +674,33 @@ def _fs_photos_for_date(
     # For non-recursive year/month keys, discover whether children would nest.
     child_keys: set[str] = set()
     for src in _sources():
-        root = Path(src["path"]).expanduser().resolve()
-        for path in _iter_images(root):
-            if str(path) in skip:
+        if _walk_root(src) is None:
+            for row in _db_dated_photos(int(src["id"]), include_culled):
+                taken = str(row.get("taken_at") or "")
+                if not taken:
+                    continue
+                if key and not taken.startswith(key):
+                    continue
+                if not include_subfolders and key:
+                    if len(key) == 4 and len(taken) >= 7:
+                        child_keys.add(taken[:7])
+                    elif len(key) == 7 and len(taken) >= 10:
+                        child_keys.add(taken[:10])
+                items.append(row)
+            continue
+        walked = _walk_root(src)
+        assert walked is not None
+        walked = walked.resolve()
+        primary = Path(src["path"]).expanduser()
+        for path in _iter_images(walked):
+            try:
+                file_rel = _rel_of(walked, path)
+                canonical = str(primary / file_rel)
+            except ValueError:
                 continue
-            taken = _date_for_file(path, indexed)
+            if canonical in skip or str(path) in skip:
+                continue
+            taken = _date_for_file(path, indexed, canonical)
             if not taken:
                 continue
             if key and not taken.startswith(key):
@@ -523,9 +713,9 @@ def _fs_photos_for_date(
             items.append({
                 "id": None,
                 "source_id": src["id"],
-                "source_label": src["label"] or root.name or str(root),
-                "path": str(path),
-                "rel_path": _rel_of(root, path),
+                "source_label": src["label"] or primary.name or str(primary),
+                "path": canonical,
+                "rel_path": file_rel,
                 "taken_at": taken,
             })
     if not include_subfolders and key and len(key) in (4, 7) and len(child_keys) >= 2:
@@ -544,23 +734,37 @@ def _fs_photos_all_folders(
     skip = set() if include_culled else _removed_paths()
     items: list[dict[str, Any]] = []
     for src in _sources():
-        root = Path(src["path"]).expanduser().resolve()
-        if not root.exists():
+        if _walk_root(src) is None:
+            items.extend(
+                _db_photos_in_folder(
+                    int(src["id"]),
+                    "",
+                    limit,
+                    include_culled=include_culled,
+                    include_subfolders=include_subfolders,
+                )
+            )
             continue
-        source_label = src["label"] or root.name or str(root)
-        for path in _iter_images(root, recursive=include_subfolders):
-            if str(path) in skip:
-                continue
+        walked = _walk_root(src)
+        if walked is None:
+            continue
+        walked = walked.resolve()
+        primary = Path(src["path"]).expanduser()
+        source_label = src["label"] or primary.name or str(primary)
+        for path in _iter_images(walked, recursive=include_subfolders):
             try:
-                file_rel = _rel_of(root, path)
+                file_rel = _rel_of(walked, path)
+                canonical = str(primary / file_rel)
                 mtime = path.stat().st_mtime
             except (ValueError, OSError):
+                continue
+            if canonical in skip or str(path) in skip:
                 continue
             items.append({
                 "id": None,
                 "source_id": src["id"],
                 "source_label": source_label,
-                "path": str(path),
+                "path": canonical,
                 "rel_path": file_rel,
                 "taken_at": datetime.fromtimestamp(mtime).isoformat(sep=" "),
                 "_mtime": mtime,
@@ -572,6 +776,18 @@ def _fs_photos_all_folders(
     return _enrich_from_db(out)
 
 
+_HAS_PLACE_SQL = """(
+    (c.country IS NOT NULL AND c.country != '')
+    OR (c.city IS NOT NULL AND c.city != '')
+    OR (c.place_label IS NOT NULL AND c.place_label != '')
+)"""
+_NO_PLACE_SQL = """(
+    (c.country IS NULL OR c.country = '')
+    AND (c.city IS NULL OR c.city = '')
+    AND (c.place_label IS NULL OR c.place_label = '')
+)"""
+
+
 def _photos_with_place(
     limit: int, include_culled: bool = False
 ) -> list[dict[str, Any]]:
@@ -580,11 +796,23 @@ def _photos_with_place(
         rows = conn.execute(
             f"""{PHOTO_SELECT}
                 WHERE {_culled_sql(include_culled, "p")}
-                  AND (
-                    (c.country IS NOT NULL AND c.country != '')
-                    OR (c.city IS NOT NULL AND c.city != '')
-                    OR (c.place_label IS NOT NULL AND c.place_label != '')
-                  )
+                  AND {_HAS_PLACE_SQL}
+                ORDER BY COALESCE(c.taken_at, '') DESC, p.id DESC
+                LIMIT ?""",
+            (limit,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _photos_without_place(
+    limit: int, include_culled: bool = False
+) -> list[dict[str, Any]]:
+    """Photos with no place_label / country / city (unlabeled Places branch)."""
+    with db() as conn:
+        rows = conn.execute(
+            f"""{PHOTO_SELECT}
+                WHERE {_culled_sql(include_culled, "p")}
+                  AND {_NO_PLACE_SQL}
                 ORDER BY COALESCE(c.taken_at, '') DESC, p.id DESC
                 LIMIT ?""",
             (limit,),
@@ -637,152 +865,101 @@ def _collapse_pass_through(node: dict[str, Any]) -> dict[str, Any]:
     return node
 
 
+def _place_tree_parts(label: str) -> list[str]:
+    """Country-first path from a reverse-hierarchy Place label."""
+    raw = [p.strip() for p in str(label).split(",") if p.strip()]
+    if not raw:
+        return []
+    parts: list[str] = []
+    for name in reversed(raw):
+        if not parts or parts[-1].lower() != name.lower():
+            parts.append(name)
+    return parts
+
+
+def _place_trie_bump(trie: dict[str, Any], parts: list[str], count: int) -> None:
+    node = trie
+    for i, name in enumerate(parts):
+        child = node["children"].setdefault(
+            name, {"count": 0, "direct": 0, "children": {}}
+        )
+        child["count"] += count
+        if i == len(parts) - 1:
+            child["direct"] += count
+        node = child
+
+
+def _nodes_from_place_trie(
+    children: dict[str, Any], prefix: list[str]
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for name, data in sorted(
+        children.items(), key=lambda x: (-x[1]["count"], x[0].lower())
+    ):
+        path_names = prefix + [name]
+        suffix = ", ".join(reversed(path_names))
+        node: dict[str, Any] = {
+            "name": name,
+            "path": f"place-suffix::{suffix}",
+            "kind": "place",
+            "count": data["count"],
+            "direct_count": data["direct"],
+        }
+        nested = _nodes_from_place_trie(data["children"], path_names)
+        if nested:
+            node["children"] = nested
+        out.append(node)
+    return out
+
+
 def location_tree(include_culled: bool = False) -> list[dict[str, Any]]:
-    """Return region → country → city → venue tree plus freeform place_label leaves.
+    """Nest Places by reversed Place labels (country → … → venue).
 
-    Admin regions without a city (e.g. ``Hawaii, United States``) nest as a
-    place node under the country, same as cities. Venues nest under their city
-    or under that admin region when city is empty.
-
-    A sole child is folded into the parent display name (``Parent / Child``)
-    and the node adopts the child's path so photo queries stay correct —
-    applied recursively. Manual / directory labels without structured country
-    yet are folded into the same tree; other freeform labels stay top-level
-    leaves.
+    ``Quebec, Hawaii, United States`` becomes United States → Hawaii → Quebec,
+    matching folder-style Place edits. Continents still wrap known countries.
+    A sole child is folded into the parent display name (``Parent / Child``).
     """
-    from fotoman.geocode import normalize_country, parse_city_country
+    from fotoman.geocode import _format_place
 
     with db() as conn:
-        rows = conn.execute(
-            f"""SELECT c.country, c.city, c.region, c.venue, COUNT(*) AS count
-               FROM photos p
-               JOIN photo_contents c ON c.id = p.content_id
-               JOIN sources s ON s.id = p.source_id
-               WHERE {_culled_sql(include_culled, 'p')}
-                 AND c.country IS NOT NULL AND c.country != ''
-               GROUP BY c.country, c.city, c.region, c.venue"""
-        ).fetchall()
-        freeform = conn.execute(
+        labeled = conn.execute(
             f"""SELECT c.place_label AS label, COUNT(*) AS count
                FROM photos p
                JOIN photo_contents c ON c.id = p.content_id
                JOIN sources s ON s.id = p.source_id
                WHERE {_culled_sql(include_culled, 'p')}
                  AND c.place_label IS NOT NULL AND c.place_label != ''
-                 AND (c.country IS NULL OR c.country = '')
                GROUP BY c.place_label"""
         ).fetchall()
+        structured = conn.execute(
+            f"""SELECT c.country, c.city, c.region, c.venue, COUNT(*) AS count
+               FROM photos p
+               JOIN photo_contents c ON c.id = p.content_id
+               JOIN sources s ON s.id = p.source_id
+               WHERE {_culled_sql(include_culled, 'p')}
+                 AND (c.place_label IS NULL OR c.place_label = '')
+                 AND c.country IS NOT NULL AND c.country != ''
+               GROUP BY c.country, c.city, c.region, c.venue"""
+        ).fetchall()
 
-    # country → {count, cities: name → {count, direct, venues: name → count}}
-    countries: dict[str, dict[str, Any]] = {}
+    trie: dict[str, Any] = {"children": {}}
+    for r in labeled:
+        parts = _place_tree_parts(r["label"] or "")
+        if parts:
+            _place_trie_bump(trie, parts, int(r["count"]))
+    for r in structured:
+        label = _format_place(
+            r["city"], r["region"], r["country"], venue=r["venue"]
+        )
+        parts = _place_tree_parts(label or r["country"] or "")
+        if parts:
+            _place_trie_bump(trie, parts, int(r["count"]))
 
-    def _bump_city(country: str, city: str, venue: str | None, count: int) -> None:
-        entry = countries.setdefault(country, {"count": 0, "cities": {}})
-        entry["count"] += count
-        cities: dict[str, dict[str, Any]] = entry["cities"]
-        node = cities.setdefault(city, {"count": 0, "direct": 0, "venues": {}})
-        node["count"] += count
-        if venue:
-            venues: dict[str, int] = node["venues"]
-            venues[venue] = venues.get(venue, 0) + count
-        else:
-            node["direct"] += count
-
-    for r in rows:
-        country = normalize_country(r["country"]) or r["country"]
-        city = (r["city"] or "").strip() or None
-        region = (r["region"] or "").strip() or None
-        venue = (r["venue"] or "").strip() or None
-        cnt = int(r["count"])
-        # City wins; otherwise admin region is the place node (Hawaii, Quebec).
-        parent = city or region
-        if parent and parent.lower() != country.lower():
-            _bump_city(country, parent, venue, cnt)
-        else:
-            entry = countries.setdefault(country, {"count": 0, "cities": {}})
-            entry["count"] += cnt
-
-    leftover_freeform: list[dict[str, Any]] = []
-    for r in freeform:
-        label = (r["label"] or "").strip()
-        if not label:
-            continue
-        parsed = parse_city_country(label)
-        country = parsed.get("country")
-        city = (parsed.get("city") or "").strip() or None
-        region = (parsed.get("region") or "").strip() or None
-        venue = (parsed.get("venue") or "").strip() or None
-        cnt = int(r["count"])
-        parent = city or region
-        if country and parent and parent.lower() != country.lower():
-            _bump_city(country, parent, venue, cnt)
-        elif country:
-            entry = countries.setdefault(country, {"count": 0, "cities": {}})
-            entry["count"] += cnt
-        else:
-            leftover_freeform.append(r)
-
-    country_nodes: list[dict[str, Any]] = []
-    for country, data in countries.items():
-        cities_raw = {
-            city: info
-            for city, info in data["cities"].items()
-            if city.lower() != country.lower()
-        }
-        direct_leaves = data["count"] - sum(info["count"] for info in cities_raw.values())
-        city_children: list[dict[str, Any]] = []
-        for city, info in sorted(
-            cities_raw.items(), key=lambda x: (-x[1]["count"], x[0].lower())
-        ):
-            venue_children = [
-                {
-                    "name": venue,
-                    "path": f"venue::{country}::{city}::{venue}",
-                    "kind": "venue",
-                    "count": vcnt,
-                    "direct_count": vcnt,
-                }
-                for venue, vcnt in sorted(
-                    info["venues"].items(), key=lambda x: (-x[1], x[0].lower())
-                )
-            ]
-            city_node: dict[str, Any] = {
-                "name": city,
-                "path": f"city::{country}::{city}",
-                "kind": "city",
-                "count": info["count"],
-                "direct_count": info["direct"],
-            }
-            if venue_children:
-                city_node["children"] = venue_children
-            city_children.append(city_node)
-
-        if city_children:
-            country_nodes.append(
-                {
-                    "name": country,
-                    "path": f"country::{country}",
-                    "kind": "country",
-                    "count": data["count"],
-                    "direct_count": direct_leaves,
-                    "children": city_children,
-                }
-            )
-        else:
-            country_nodes.append(
-                {
-                    "name": country,
-                    "path": f"country::{country}",
-                    "kind": "country",
-                    "count": data["count"],
-                    "direct_count": data["count"],
-                }
-            )
-
+    top_nodes = _nodes_from_place_trie(trie["children"], [])
     country_to_region, _ = _load_region_map()
     by_region: dict[str, list[dict[str, Any]]] = {}
     ungrouped: list[dict[str, Any]] = []
-    for node in country_nodes:
+    for node in top_nodes:
         region = country_to_region.get(node["name"].lower())
         if region:
             by_region.setdefault(region, []).append(node)
@@ -802,21 +979,7 @@ def location_tree(include_culled: bool = False) -> list[dict[str, Any]]:
                 "children": nodes,
             }
         )
-
     result.extend(ungrouped)
-
-    for r in leftover_freeform:
-        label = (r["label"] or "").strip()
-        result.append(
-            {
-                "name": label,
-                "path": f"place::{label}",
-                "kind": "place",
-                "count": int(r["count"]),
-                "direct_count": int(r["count"]),
-            }
-        )
-
     result = [_collapse_pass_through(n) for n in result]
     result.sort(key=lambda x: (-x["count"], x["name"].lower()))
     return result
@@ -829,6 +992,9 @@ def _photos_for_location(
     include_subfolders: bool = True,
 ) -> list[dict[str, Any]]:
     from fotoman.geocode import normalize_country
+
+    if key == "unplaced":
+        return _photos_without_place(limit, include_culled=include_culled)
 
     clauses = [_culled_sql(include_culled, "p")]
     params: list[Any] = []
@@ -846,10 +1012,8 @@ def _photos_for_location(
             parts.append(
                 """(
                     c.country = ?
-                    OR (
-                        (c.country IS NULL OR c.country = '')
-                        AND (c.place_label = ? OR c.place_label LIKE ?)
-                    )
+                    OR c.place_label = ?
+                    OR c.place_label LIKE ?
                 )"""
             )
             params.extend([country, country, f"%, {country}"])
@@ -954,6 +1118,14 @@ def _photos_for_location(
     elif key.startswith("place::"):
         clauses.append("c.place_label = ?")
         params.append(key[len("place::") :])
+    elif key.startswith("place-suffix::"):
+        label = key[len("place-suffix::") :]
+        if include_subfolders:
+            clauses.append("(c.place_label = ? OR c.place_label LIKE ?)")
+            params.extend([label, f"%, {label}"])
+        else:
+            clauses.append("c.place_label = ?")
+            params.append(label)
     else:
         clauses.append("c.place_label = ?")
         params.append(key)
@@ -976,6 +1148,21 @@ def group_list(group_by: str, include_culled: bool = False) -> list[dict[str, An
         return _date_groups_from_fs()
 
     with db() as conn:
+        if group_by == "aspect":
+            rows = conn.execute(
+                f"""SELECT {ASPECT_CLASS_SQL} AS key, COUNT(*) AS count
+                    FROM photos p
+                    JOIN photo_contents c ON c.id = p.content_id
+                    WHERE {_culled_sql(include_culled, 'p')}
+                      AND ({ASPECT_CLASS_SQL}) IS NOT NULL
+                    GROUP BY {ASPECT_CLASS_SQL}""",
+            ).fetchall()
+            counts = {r["key"]: r["count"] for r in rows}
+            return [
+                {"key": k, "label": ASPECT_LABELS[k], "count": counts[k]}
+                for k in ASPECT_CLASSES
+                if counts.get(k)
+            ]
         if group_by == "album":
             col = "p.album"
         elif group_by == "camera":
@@ -1017,6 +1204,8 @@ def photos_for_group(
         if group_by == "date":
             return _fs_photos_for_date("", limit, include_culled=include_culled)
         if group_by == "location":
+            if labeled is False:
+                return _photos_without_place(limit, include_culled=include_culled)
             return _photos_with_place(limit, include_culled=include_culled)
         if group_by == "person":
             from fotoman import faces
@@ -1030,6 +1219,37 @@ def photos_for_group(
                     f"""{PHOTO_SELECT}
                         WHERE {_culled_sql(include_culled, "p")}
                           AND c.camera IS NOT NULL AND c.camera != ''
+                        ORDER BY COALESCE(c.taken_at, '') DESC, p.id DESC
+                        LIMIT ?""",
+                    (limit,),
+                ).fetchall()
+            return [dict(r) for r in rows]
+        if group_by == "collection":
+            from fotoman import collections
+
+            by_id: dict[int, dict[str, Any]] = {}
+            for folder in collections.list_collections(include_culled=include_culled):
+                for p in collections.photos_for_collection(
+                    int(folder["id"]),
+                    limit=limit,
+                    include_culled=include_culled,
+                    include_subfolders=True,
+                ):
+                    pid = p.get("id")
+                    if pid is not None:
+                        by_id[int(pid)] = p
+            items = sorted(
+                by_id.values(),
+                key=lambda p: (p.get("taken_at") or "", p.get("id") or 0),
+                reverse=True,
+            )
+            return items[:limit]
+        if group_by == "aspect":
+            with db() as conn:
+                rows = conn.execute(
+                    f"""{PHOTO_SELECT}
+                        WHERE {_culled_sql(include_culled, "p")}
+                          AND ({ASPECT_CLASS_SQL}) IS NOT NULL
                         ORDER BY COALESCE(c.taken_at, '') DESC, p.id DESC
                         LIMIT ?""",
                     (limit,),
@@ -1073,12 +1293,15 @@ def photos_for_group(
             )
         except (TypeError, ValueError):
             return []
-    if group_by == "vfolder":
-        from fotoman import vfolders
+    if group_by == "collection":
+        from fotoman import collections
 
         try:
-            return vfolders.photos_for_folder(
-                int(key), limit, include_culled=include_culled
+            return collections.photos_for_collection(
+                collections.resolve_collection_key(key),
+                limit,
+                include_culled=include_culled,
+                include_subfolders=include_subfolders,
             )
         except (TypeError, ValueError):
             return []
@@ -1098,6 +1321,11 @@ def photos_for_group(
 
     if group_by == "camera":
         clauses.append("c.camera = ?")
+        params.append(key)
+    elif group_by == "aspect":
+        if key not in ASPECT_CLASSES:
+            return []
+        clauses.append(f"({ASPECT_CLASS_SQL}) = ?")
         params.append(key)
     elif group_by == "album":
         clauses.append("p.album = ?")
@@ -1157,3 +1385,72 @@ def cluster_list(
             })
 
     return result
+
+
+def _find_tree_node(nodes: list[dict[str, Any]], path: str) -> dict[str, Any] | None:
+    want = str(path)
+    for node in nodes or []:
+        if str(node.get("path")) == want:
+            return node
+        found = _find_tree_node(node.get("children") or [], want)
+        if found:
+            return found
+    return None
+
+
+def subtree_for_key(
+    group_by: str,
+    key: str,
+    include_culled: bool = False,
+) -> dict[str, Any] | None:
+    """Source browse node (with children) to copy into a collection tree."""
+    if not key:
+        return None
+    if group_by == "folder":
+        source_id = None
+        sid, sep, _rest = str(key).partition(":")
+        if sep and sid.isdigit():
+            source_id = int(sid)
+        return _find_tree_node(
+            folder_tree(
+                source_id=source_id,
+                include_files=False,
+                include_culled=include_culled,
+            ),
+            key,
+        )
+    if group_by == "date":
+        from fotoman.config import load_settings
+
+        order = str(load_settings().get("date_tree_order") or "newest").lower()
+        return _find_tree_node(
+            date_tree(
+                include_culled=include_culled,
+                newest_first=order != "oldest",
+            ),
+            key,
+        )
+    if group_by == "location":
+        return _find_tree_node(location_tree(include_culled=include_culled), key)
+    if group_by == "camera":
+        return {"name": key, "path": key, "children": []}
+    if group_by == "aspect":
+        if key not in ASPECT_CLASSES:
+            return None
+        return {"name": ASPECT_LABELS[key], "path": key, "children": []}
+    if group_by == "person":
+        from fotoman import faces
+
+        try:
+            pid = int(key)
+        except (TypeError, ValueError):
+            return None
+        for person in faces.people_list():
+            if int(person["id"]) == pid:
+                return {
+                    "name": person.get("display_name") or f"Person {pid}",
+                    "path": str(pid),
+                    "children": [],
+                }
+        return None
+    return None

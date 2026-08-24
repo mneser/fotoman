@@ -15,9 +15,10 @@
 </head>
 <body>
   <header class="top">
-    <div class="brand">Fotoman</div>
+    <button type="button" class="brand" id="btn-open-about" title="About Fotoman">Fotoman</button>
     <button type="button" id="btn-open-prefs" class="archive-btn">Preferences</button>
-    <button type="button" id="btn-open-archive" class="archive-btn">Archive</button>
+    <button type="button" id="btn-open-archive" class="archive-btn">Library</button>
+    <button type="button" class="press-btn browse-cardinal-opt" id="browse-show-nested" aria-pressed="false" title="People: labeled vs unlabeled. Places: unlabeled at root, nested in children. Library/collections/dates: include nested items.">Show labeled images</button>
     <div id="stats" class="stats"></div>
   </header>
 
@@ -32,41 +33,56 @@
       </form>
 
       <div class="workspace-toolbar">
-        <div class="browse-view-modes" role="group" aria-label="Workspace view">
-          <button type="button" class="browse-view-btn active" data-workspace-view="thumbs">Gallery</button>
-          <button type="button" class="browse-view-btn" data-workspace-view="map">Mapview</button>
-          <button type="button" class="browse-view-btn" data-workspace-view="details">Details</button>
-          <button type="button" class="browse-view-btn" data-workspace-view="dupes">Clusters</button>
+        <div class="visibility-modes" role="group" aria-label="Photo visibility">
+          <button type="button" class="visibility-btn active" data-visibility="active" title="Hide rejected photos">Active</button>
+          <button type="button" class="visibility-btn" data-visibility="removed" title="Rejected photos only">Rejected</button>
+          <button type="button" class="visibility-btn" data-visibility="all" title="Show active and rejected">All</button>
+          <button type="button" class="visibility-btn" data-visibility="selected" title="Currently selected photos only" hidden>Selected</button>
         </div>
-        <button type="button" class="press-btn browse-cardinal-opt" id="browse-show-nested" aria-pressed="false" title="People: labeled vs unlabeled. Folders/dates/places: include nested items.">Show labeled images</button>
-        <label class="browse-size-control" id="browse-size-control" title="Thumbnail size">
-          <input id="browse-tile-size" type="range" min="64" max="376" step="4" value="156" aria-label="Thumbnail size" />
-        </label>
-        <label class="cluster-level-control" title="Clustering level: each step includes all lower levels" hidden>
-          <input id="cluster-level" type="range" min="0" max="7" step="1" value="5" />
-          <span id="cluster-level-label" class="muted">Similar</span>
-        </label>
-        <div class="browse-view-opts" role="group" aria-label="View options">
-          <div class="visibility-modes" role="group" aria-label="Photo visibility">
-            <button type="button" class="visibility-btn active" data-visibility="active" title="Hide removed photos">Active</button>
-            <button type="button" class="visibility-btn" data-visibility="all" title="Show active and removed">All</button>
-            <button type="button" class="visibility-btn" data-visibility="removed" title="Removed photos only">Removed</button>
-            <button type="button" class="visibility-btn" data-visibility="selected" title="Currently selected photos only">Selected</button>
-          </div>
-          <button type="button" class="press-btn browse-opt" id="browse-show-face" aria-pressed="true" hidden>Faces</button>
-          <button type="button" class="press-btn browse-opt" id="browse-show-months" aria-pressed="false" hidden>Months</button>
+        <div class="visibility-modes aspect-filter-wrap">
+          <label class="aspect-filter-label">
+            <span class="visually-hidden">Aspect</span>
+            <select id="aspect-filter" aria-label="Aspect">
+              <option value="">All aspects</option>
+              <option value="landscape">Landscape</option>
+              <option value="portrait">Portrait</option>
+              <option value="square">Square</option>
+              <option value="panorama">Panorama</option>
+            </select>
+          </label>
         </div>
+        <div class="visibility-modes" role="group" aria-label="Workspace view">
+          <button type="button" class="visibility-btn browse-view-btn active" data-workspace-view="stack">Stack</button>
+          <button type="button" class="visibility-btn browse-view-btn" data-workspace-view="compare">Compare</button>
+          <button type="button" class="visibility-btn browse-view-btn" data-workspace-view="map">Map</button>
+          <button type="button" class="visibility-btn browse-view-btn" data-workspace-view="details">Details</button>
+        </div>
+        <label class="browse-size-control" id="browse-size-control" title="Card size">
+          Card size
+          <input id="browse-tile-size" type="range" min="64" max="376" step="4" value="156" aria-label="Card size" />
+        </label>
+        <label class="cluster-level-control" title="Cluster method and range" hidden>
+          Cluster
+          <span class="cluster-method-wrap">
+            <select id="cluster-method" aria-label="Cluster method">
+              <option value="HASH_VECTOR">Hash+vector</option>
+              <option value="SCENE_MATCH">Scene match</option>
+            </select>
+          </span>
+          <input id="cluster-level" type="range" min="0" max="7" step="1" value="5" aria-label="Cluster range" />
+        </label>
+        <button type="button" class="press-btn browse-opt" id="browse-show-face" aria-pressed="true" hidden>Face</button>
         <div class="browse-gallery-actions">
           <span id="browse-gallery-count" class="muted browse-gallery-count"></span>
           <button type="button" id="btn-browse-select-all" class="browse-select-all" hidden>Select all</button>
           <div class="browse-selection-actions" hidden>
-            <button type="button" id="btn-browse-similar" disabled>Find similar</button>
-            <button type="button" id="btn-browse-add-folder" disabled>Add to collection</button>
-            <button type="button" id="btn-browse-remove-folder" disabled hidden>Remove from folder</button>
-            <button type="button" id="btn-browse-edit" disabled>Edit selection</button>
-            <button type="button" id="btn-browse-remove" class="danger" disabled>Remove selected</button>
-            <button type="button" id="btn-browse-restore" disabled>Restore selected</button>
-            <button type="button" id="btn-browse-delete" class="danger" disabled>Delete selected</button>
+            <button type="button" id="btn-browse-similar" disabled hidden>Find similar</button>
+            <button type="button" id="btn-browse-add-folder" disabled hidden>Add to collection</button>
+            <button type="button" id="btn-browse-remove-folder" disabled hidden>Remove from collection</button>
+            <button type="button" id="btn-browse-edit" disabled hidden>Edit selection</button>
+            <button type="button" id="btn-browse-export" disabled hidden>Export selected</button>
+            <button type="button" id="btn-browse-remove" class="danger" disabled>Reject selected</button>
+            <button type="button" id="btn-browse-delete" class="danger icon-btn" disabled title="Delete selected" aria-label="Delete selected"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M6 19a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg></button>
           </div>
         </div>
       </div>
@@ -77,13 +93,12 @@
 
       <section id="tab-map" class="panel">
         <div class="map-toolbar">
-          <span id="map-status" class="muted">Loading map…</span>
+          <div id="map-status" class="muted" aria-live="polite"></div>
         </div>
         <div id="photo-map" class="photo-map" role="application" aria-label="Photo map"></div>
       </section>
 
       <section id="tab-dupes" class="panel">
-        <p class="muted">Click to select, double-click to open. Primary is auto-picked by resolution. Use the visibility control for removed photos.</p>
         <div id="dupe-list"></div>
         <div id="regroup-overlay" class="busy-overlay" hidden>
           <div class="busy-mark" role="status" aria-label="Regrouping">
@@ -112,48 +127,92 @@
 
   <dialog id="archive-dialog" class="archive-dialog draggable-dialog">
     <div class="dialog-head">
-      <h2>Archives</h2>
-      <button type="button" id="btn-add-source">Add archive</button>
+      <h2>Library</h2>
+      <button type="button" id="btn-add-source">Add folder</button>
+      <button type="button" id="btn-pair-device">Pair phone</button>
+      <button type="button" id="btn-import-zip">Import zip</button>
       <button type="button" id="btn-close-archive" class="dialog-x">✕</button>
     </div>
+    <p class="archive-reclaim">
+      Request a ZIP from
+      <a href="https://takeout.google.com/settings/takeout/custom/google_photos?dest=drive" target="_blank" rel="noopener">Google Photos</a>,
+      <a href="https://www.facebook.com/dyi/" target="_blank" rel="noopener">Facebook</a>,
+      or
+      <a href="https://accountscenter.instagram.com/info_and_permissions/dyi/" target="_blank" rel="noopener">Instagram</a>
+      (Photos only; Facebook/Instagram: JSON). Download, then Import zip — Fotoman unpacks and indexes it.
+    </p>
     <div class="index-bar">
       <ol class="index-stages" id="index-stages" aria-label="Processing stages: filled = running, solid orange = scheduled, muted = idle or done. Disable Embed/Facematch to idle those stages."></ol>
       <p id="index-status" class="muted"></p>
     </div>
-    <ul id="source-list" class="source-list"></ul>
+    <div class="source-table-wrap">
+      <table class="source-table">
+        <thead>
+          <tr>
+            <th class="source-col-vol">Volume</th>
+            <th class="source-col-check" title="Include in the library">In</th>
+            <th class="source-col-check" title="Facematch">Faces</th>
+            <th class="source-col-check" title="Embed">Embed</th>
+            <th class="source-col-check" title="Keep a second copy in a shadow folder">Shadow</th>
+            <th class="source-col-check" title="Fill missing files on the other copy when both are mounted">Sync</th>
+            <th class="source-col-act"></th>
+          </tr>
+        </thead>
+        <tbody id="source-list"></tbody>
+      </table>
+    </div>
   </dialog>
 
   <dialog id="lightbox">
     <div class="lightbox-body">
-      <button type="button" id="lightbox-prev" class="lightbox-nav lightbox-prev" aria-label="Previous" hidden>&#9664;</button>
-      <div class="lightbox-stage">
-        <img id="lightbox-img" alt="" />
-        <div id="lightbox-faces" class="lightbox-faces" hidden></div>
+      <div class="lightbox-stage-wrap">
+        <div class="lightbox-stage">
+          <img id="lightbox-img" alt="" />
+          <div id="lightbox-faces" class="lightbox-faces" hidden></div>
+        </div>
+        <span id="lightbox-removed-badge" class="removed-badge lightbox-removed-badge" hidden>REJECTED</span>
+        <div id="lightbox-zoom-hud" class="lightbox-zoom-hud" hidden>
+          <div id="lightbox-zoom-scale" class="lightbox-zoom-scale">1×</div>
+          <div class="lightbox-zoom-nav" aria-hidden="true">
+            <img id="lightbox-zoom-thumb" alt="" draggable="false" />
+            <div id="lightbox-zoom-roi" class="lightbox-zoom-roi"></div>
+          </div>
+        </div>
+        <div class="lightbox-nav-bar" role="group" aria-label="Image navigation">
+          <button type="button" id="lightbox-up" class="lightbox-nav lightbox-up" aria-label="Previous in cluster" disabled>&#9650;</button>
+          <button type="button" id="lightbox-prev" class="lightbox-nav lightbox-prev" aria-label="Previous" disabled>&#9664;</button>
+          <span id="lightbox-cluster-pos" class="lightbox-cluster-pos" aria-live="polite"></span>
+          <button type="button" id="lightbox-next" class="lightbox-nav lightbox-next" aria-label="Next" disabled>&#9654;</button>
+          <button type="button" id="lightbox-down" class="lightbox-nav lightbox-down" aria-label="Next in cluster" disabled>&#9660;</button>
+        </div>
       </div>
-      <button type="button" id="lightbox-next" class="lightbox-nav lightbox-next" aria-label="Next" hidden>&#9654;</button>
       <aside id="lightbox-info" class="lightbox-info" hidden>
         <div class="lightbox-info-props">
           <dl id="lightbox-meta" class="lightbox-meta"></dl>
           <div id="lightbox-edit" class="lightbox-edit" hidden>
-            <label class="prop-field">Date
+            <label class="prop-field">
               <input type="datetime-local" id="lightbox-taken-at" step="1" />
             </label>
             <label class="prop-field">Place
               <input type="text" id="lightbox-place" placeholder="City, [State,] Country" autocomplete="off" />
             </label>
-            <label class="prop-field">Orientation
-              <select id="lightbox-orientation">
-                <option value="0">0°</option>
-                <option value="90">90° CW</option>
-                <option value="180">180°</option>
-                <option value="270">270° CW</option>
-              </select>
-            </label>
+            <div class="prop-field lightbox-orient-field">
+              <div class="lightbox-orient">
+                <input type="hidden" id="lightbox-orientation" value="0" />
+                <button type="button" class="lightbox-orient-rotate" id="lightbox-rotate" aria-pressed="false" aria-label="Rotate 90° clockwise" title="Rotate">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 6V1l5 5-5 5V7c-3.31 0-6 2.69-6 6s2.69 6 6 6 6-2.69 6-6h2c0 4.42-3.58 8-8 8s-8-3.58-8-8 3.58-8 8-8z"/></svg>
+                </button>
+                <button type="button" class="lightbox-orient-flip" id="lightbox-mirror" aria-pressed="false" aria-label="Mirror" title="Mirror">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M11 2h2v20h-2z"/><path fill="currentColor" d="M9 5.5v13L3 12l6-6.5zm6 0 6 6.5-6 6.5v-13z"/></svg>
+                </button>
+              </div>
+            </div>
             <div class="lightbox-edit-actions">
-              <button type="button" class="press-btn lightbox-mirror-opt" id="lightbox-mirror" aria-pressed="false">Mirror</button>
-              <button type="button" id="lightbox-similar" class="lightbox-save">Find similar</button>
-              <button type="button" id="lightbox-remove" class="danger lightbox-remove">Remove</button>
+              <button type="button" id="lightbox-write-exif" class="lightbox-save" hidden>Write to EXIF</button>
+              <button type="button" id="lightbox-similar" class="lightbox-save" hidden>Find similar</button>
+              <button type="button" id="lightbox-remove" class="danger lightbox-remove">Reject</button>
               <button type="button" id="lightbox-restore" class="lightbox-restore" hidden>Restore</button>
+              <button type="button" id="lightbox-delete" class="danger lightbox-delete" hidden aria-label="Delete" title="Delete"><svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg></button>
             </div>
             <p id="lightbox-edit-error" class="error" hidden></p>
           </div>
@@ -163,22 +222,47 @@
         <div id="lightbox-vqa" class="lightbox-vqa" hidden>
           <p id="lightbox-vqa-disabled" class="muted lightbox-vqa-disabled" hidden>Configure a VLM in Preferences to enable Ask AI.</p>
           <div id="lightbox-vqa-controls" class="lightbox-vqa-controls">
+            <div id="lightbox-vqa-freeform-wrap" class="lightbox-vqa-freeform">
+              <textarea id="lightbox-vqa-prompt" rows="2" placeholder="Ask anything about this photo… Enter to send" aria-label="Ask about this photo"></textarea>
+            </div>
             <div class="lightbox-vqa-presets" role="group" aria-label="Ask AI">
               <button type="button" class="press-btn lightbox-vqa-preset" data-vqa-task="where" aria-pressed="false">Where is this?</button>
               <button type="button" class="press-btn lightbox-vqa-preset" data-vqa-task="describe" aria-pressed="false">Describe</button>
               <button type="button" class="press-btn lightbox-vqa-preset active" data-vqa-task="freeform" aria-pressed="true">Ask…</button>
             </div>
-            <label id="lightbox-vqa-freeform-wrap" class="prop-field">Your question
-              <textarea id="lightbox-vqa-prompt" rows="2" placeholder="Ask anything about this photo…"></textarea>
-            </label>
-            <button type="button" id="lightbox-vqa-ask" class="lightbox-save">Ask</button>
             <p id="lightbox-vqa-error" class="error" hidden></p>
             <p id="lightbox-vqa-answer" class="lightbox-vqa-answer" hidden></p>
           </div>
         </div>
       </aside>
     </div>
+    <button type="button" id="lightbox-fullscreen" class="lightbox-fullscreen-btn" aria-pressed="false" title="Full screen">
+      <svg class="lightbox-fs-enter" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z"/></svg>
+      <svg class="lightbox-fs-exit" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M5 16h3v3h2v-5H5v2zm3-8H5v2h5V5H8v3zm6 11h2v-3h3v-2h-5v5zm2-11V5h-2v5h5V8h-3z"/></svg>
+    </button>
     <form method="dialog"><button class="dialog-x">✕</button></form>
+  </dialog>
+
+  <dialog id="about-dialog" class="props-dialog about-dialog draggable-dialog">
+    <div class="dialog-head">
+      <h2>About</h2>
+      <button type="button" id="btn-close-about" class="dialog-x">✕</button>
+    </div>
+    <div class="about-body">
+      <img class="about-logo" src="/fotoman.png" alt="Fotoman" draggable="false" />
+      <p class="about-mission">Your local photo library — find what you kept, cull near-duplicates, and stay organized without the cloud.</p>
+      <p class="about-version muted">Version <span id="about-version">…</span></p>
+      <h3 class="pref-section">Tips</h3>
+      <ul class="about-tips">
+        <li>Describe a scene in the search bar to find photos by meaning.</li>
+        <li>Browse the tree by Library, Collections, Dates, Places, or People.</li>
+        <li>Use Active / Rejected / All to focus on what you kept or soft-rejected.</li>
+        <li>Compare shows similar clusters; partners outside the tree selection are marked OUTSIDE.</li>
+        <li>Drag the timeline to select photos by date; right-click clears the brush selection.</li>
+        <li>Right-click a photo (or a selection) to edit dates and places. Build Collections without moving files; nest them, or export a collection as a folder tree (optionally a new volume).</li>
+        <li>Add volumes for phone dumps, NAS, or folders from Reclaimer exports.</li>
+      </ul>
+    </div>
   </dialog>
 
   <dialog id="prefs-dialog" class="props-dialog prefs-dialog draggable-dialog">
@@ -188,54 +272,45 @@
         <button type="button" id="btn-close-prefs" class="dialog-x">✕</button>
       </div>
       <div class="prop-fields">
-        <label class="prop-field">SigLIP model
-          <input type="text" id="pref-model-id" name="model_id" value="google/siglip-base-patch16-224" autocomplete="off" spellcheck="false" />
-        </label>
-        <p class="muted pref-hint">Changing the model requires re-embedding archives.</p>
         <label class="prop-field">Near-duplicate threshold
           <input type="number" id="pref-near-dup" name="near_dup_threshold" value="0.92" min="0.8" max="0.999" step="0.01" />
         </label>
         <label class="prop-field">Face match threshold
           <input type="number" id="pref-face-match" name="face_match_threshold" value="0.363" min="0.2" max="0.9" step="0.001" />
         </label>
-        <label class="prop-field">Date tree order
-          <select id="pref-date-tree-order" name="date_tree_order">
-            <option value="newest" selected>Newest first</option>
-            <option value="oldest">Oldest first</option>
-          </select>
-        </label>
-        <label class="prop-field">After editing Place
-          <select id="pref-place-edit-nav" name="place_edit_nav">
-            <option value="stay" selected>Stay in current selection</option>
-            <option value="follow">Jump to that place</option>
-          </select>
-        </label>
-        <h3 class="pref-section">Date edits</h3>
         <label class="prop-check">
-          <input type="checkbox" id="pref-write-date-exif" name="write_date_to_exif" />
-          Write date into image EXIF (changes file hash)
+          <input type="checkbox" id="pref-place-edit-nav" />
+          Jump to place after editing
         </label>
+        <h3 class="pref-section">Gallery</h3>
+        <label class="prop-check">
+          <input type="checkbox" id="pref-thumb-crop" />
+          Fill thumbnail cards
+        </label>
+        <p class="muted pref-hint">Off shows the full image (long edge). On crops to fill (short edge).</p>
+        <h3 class="pref-section">Date edits</h3>
         <label class="prop-check">
           <input type="checkbox" id="pref-write-date-mtime" name="write_date_to_mtime" />
           Sync file modification time to date (hash unchanged)
         </label>
-        <p class="muted pref-hint">Both off by default — edits stay in the database only.</p>
-        <h3 class="pref-section">VQA</h3>
-        <label class="prop-field">Provider
-          <select id="pref-vqa-provider" name="vqa_provider">
-            <option value="openai" selected>OpenAI-compatible</option>
-            <option value="none">Off</option>
-          </select>
+        <p class="muted pref-hint">On by default. Does not change file bytes or hash. Collection export also stamps dest files this way.</p>
+        <h3 class="pref-section">Collections</h3>
+        <label class="prop-check">
+          <input type="checkbox" id="pref-collection-copies" />
+          Add whole cluster when adding photos
         </label>
-        <label class="prop-field">API key
-          <input type="password" id="pref-vqa-api-key" name="vqa_api_key" autocomplete="off" placeholder="sk-…" />
-        </label>
-        <p id="pref-vqa-key-status" class="muted pref-hint" hidden></p>
+        <p class="muted pref-hint">Also adds near-duplicates of the selected photos. Export writes current members only.</p>
+        <h3 class="pref-section">Fotomob</h3>
+        <p class="muted pref-hint">Collections are on Fotomob. Right-click a collection for the share link. Delete a collection to remove it.</p>
+        <h3 class="pref-section">AI support</h3>
         <label class="prop-field">Base URL
-          <input type="url" id="pref-vqa-base-url" name="vqa_base_url" value="https://api.openai.com/v1" autocomplete="off" spellcheck="false" />
+          <input type="url" id="pref-vqa-base-url" name="vqa_base_url" autocomplete="off" spellcheck="false" placeholder="https://api.openai.com/v1" />
         </label>
         <label class="prop-field">Model
           <input type="text" id="pref-vqa-model" name="vqa_model" value="gpt-4o-mini" autocomplete="off" spellcheck="false" />
+        </label>
+        <label class="prop-field">API key
+          <input type="password" id="pref-vqa-api-key" name="vqa_api_key" autocomplete="off" placeholder="sk-…" />
         </label>
       </div>
       <p id="prefs-error" class="error" hidden></p>
@@ -245,15 +320,15 @@
     </form>
   </dialog>
 
-  <dialog id="edit-properties" class="props-dialog draggable-dialog">
+  <dialog id="edit-properties" class="props-dialog">
     <form id="edit-properties-form">
       <div class="dialog-head">
-        <h2>Edit selection</h2>
+        <h2 id="edit-properties-title">Edit photos</h2>
         <button type="button" id="btn-edit-properties-cancel" class="dialog-x">✕</button>
       </div>
       <p id="edit-properties-count" class="muted"></p>
       <div class="prop-fields">
-        <label class="prop-field">Date taken
+        <label class="prop-field">Timestamp
           <input type="datetime-local" name="taken_at" id="edit-prop-taken-at" step="1" />
         </label>
         <label class="prop-field">Place
@@ -271,6 +346,10 @@
       </div>
       <p id="edit-properties-error" class="error" hidden></p>
       <div class="dialog-actions">
+        <label class="prop-check">
+          <input type="checkbox" id="edit-write-exif" />
+          Write timestamp to EXIF
+        </label>
         <button type="submit" id="btn-edit-properties-save">Save</button>
       </div>
     </form>
@@ -284,13 +363,17 @@
       </div>
       <p id="add-to-folder-count" class="muted"></p>
       <div class="prop-fields">
-        <label class="prop-field">Existing folder
+        <label class="prop-field">Existing collection
           <select id="add-to-folder-select">
             <option value="">Choose…</option>
           </select>
         </label>
         <label class="prop-field">Or create new
-          <input type="text" id="add-to-folder-new" placeholder="Folder name" autocomplete="off" />
+          <input type="text" id="add-to-folder-new" placeholder="Collection name" autocomplete="off" />
+        </label>
+        <label class="prop-check" id="add-to-folder-nested-wrap" hidden>
+          <input type="checkbox" id="add-to-folder-nested" />
+          Create as a branch of the current collection
         </label>
       </div>
       <p id="add-to-folder-error" class="error" hidden></p>
@@ -300,8 +383,68 @@
     </form>
   </dialog>
 
+  <dialog id="share-info-dialog" class="props-dialog share-info-dialog">
+    <div class="dialog-head">
+      <h2 id="share-info-title">Shared on Fotomob</h2>
+      <button type="button" id="btn-close-share-info" class="dialog-x">✕</button>
+    </div>
+    <p id="share-info-msg" class="muted">Anyone with this link can view this collection on Fotomob.</p>
+    <div id="share-info-qr" class="share-info-qr" role="img" aria-label="Share link QR code"></div>
+    <label class="prop-field">Share link
+      <input type="text" id="share-info-url" readonly autocomplete="off" spellcheck="false" />
+    </label>
+    <div class="dialog-actions">
+      <button type="button" id="btn-share-info-copy">Copy link</button>
+    </div>
+  </dialog>
+
+  <dialog id="pair-device-dialog" class="props-dialog share-info-dialog pair-device-dialog">
+    <div class="dialog-head">
+      <h2 id="pair-device-title">Pair phone</h2>
+      <button type="button" id="btn-close-pair-device" class="dialog-x">✕</button>
+    </div>
+    <p class="muted">Scan this QR in Fotomob to add this Fotoman as a phone volume.</p>
+    <div id="pair-device-qr" class="share-info-qr" role="img" aria-label="Pair phone QR code"></div>
+    <label class="prop-field">Pair link
+      <input type="text" id="pair-device-url" readonly autocomplete="off" spellcheck="false" />
+    </label>
+    <div class="dialog-actions">
+      <button type="button" id="btn-pair-device-copy">Copy link</button>
+    </div>
+  </dialog>
+
+  <dialog id="map-pin-confirm" class="props-dialog">
+    <form id="map-pin-confirm-form">
+      <div class="dialog-head">
+        <h2>Update location</h2>
+        <button type="button" id="btn-map-pin-cancel" class="dialog-x">✕</button>
+      </div>
+      <p id="map-pin-confirm-msg" class="muted"></p>
+      <div class="dialog-actions">
+        <button type="button" id="btn-map-pin-no">Cancel</button>
+        <button type="submit" id="btn-map-pin-confirm">Update</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="branch-drop-confirm" class="props-dialog">
+    <form id="branch-drop-confirm-form">
+      <div class="dialog-head">
+        <h2>Apply to branch</h2>
+        <button type="button" id="btn-branch-drop-cancel" class="dialog-x">✕</button>
+      </div>
+      <p id="branch-drop-confirm-msg" class="muted"></p>
+      <p id="branch-drop-confirm-error" class="error" hidden></p>
+      <div class="dialog-actions">
+        <button type="button" id="btn-branch-drop-no">Cancel</button>
+        <button type="submit" id="btn-branch-drop-confirm">Apply</button>
+      </div>
+    </form>
+  </dialog>
+
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin="anonymous"></script>
   <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

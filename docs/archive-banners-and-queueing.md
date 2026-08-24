@@ -20,12 +20,12 @@ Zero remaining → count hidden. The archive row currently being processed gets 
 
 ## Per-archive count line
 
-Under each archive path, e.g. `8099 listed · indexed ✓ · face-scanned ✓ · 4936 embedded`:
+Under each archive path, e.g. `8099 listed · indexed ✓ · facematched ✓ · 4936 embedded`:
 
 - **listed**: file count from the last list pass (omitted while still 0)
-- **indexed / face-scanned / embedded**: checkmark when caught up; otherwise the live count in accent (orange)
+- **indexed / facematched / embedded**: checkmark when caught up; otherwise the live count in accent (orange)
   - indexed done when `photo_count >= listed_count`
-  - face-scanned done when `pending_faces_count == 0` (and photos exist)
+  - facematched done when `pending_faces_count == 0` (and photos exist)
   - embedded done when `pending_embed_count == 0` (and photos exist)
 
 ## Live updates (SSE)
