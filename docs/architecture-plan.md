@@ -111,27 +111,13 @@ Do **not** grant write on a library-wide share code — there isn’t one for co
 
 This is on-strategy: sharing without a cloud replica. It is not auto-backup and not native camera. It still needs Fotoman online (relay pull), same as pair. Binary frames (Phase 3) matter more once albums move originals both ways.
 
-### Open-source Fotoman / keep IP on the cloud
+### Sharing
 
-Indexing stays in the open Fotoman you self-host. **Ask AI (VQA) and geocoding** become boxed calls to your cloud (no user API keys, you hold quota and prompts).
+Indexing stays on the machine that has the photos. Fotomob, in this repo, is the public relay: phones open a link, the relay asks the house for that collection, and bytes pass through without being stored. Self-host it, or point Fotoman at another relay (`fotomob_url`; the default is `https://colligator.com/fotomob`).
 
-What “keep some IP” actually means:
+Ask AI (VQA) and geocoding run from the house today (your own API keys / Nominatim). A hosted box for prompts, caching, and quota can come later. Do not upload embeddings or originals so a server can index them in the cloud.
 
-| Open (Fotoman) | Closed (your cloud) | Not worth treating as IP |
-|----------------|---------------------|---------------------------|
-| Index, embed, faces, dupes, vault | **Fotomob** (the share website + the tunnel that reaches a home box without opening router ports) | A “house is online” light |
-| Organizer UI, collections, cull, archives, Reclaimer | **Boxed VQA** — Fotoman sends a still + “where / describe / ask”; you run the model and prompts | Fancy short URLs |
-| A setting: Fotomob URL (default `colligator.com`) | **Boxed geocoding** — reverse/search/autocomplete as an API you rate-limit and cache | Raw SigLIP/YuNet weights (already public) |
-
-**Fotomob is the IP**, not indexing. It is the only piece that must live on a public machine: phones open a link, your server asks the house for that collection, bytes pass through and are not stored. If you open-source Fotomob, anyone clones colligator.com and you have no product left to sell. If you keep it closed, self-hosters still get a full library at home; **sharing to a phone goes through you** (or they write their own compatible host). That is the trade: open core, hosted share — same shape as an open VPN client + a paid coordination service.
-
-VQA and geocoding are the other keepable IP. Today they are just “call Nominatim / call OpenAI from the house.” Moving the *box* to your cloud means: prompts, caching, billing, and no key in Fotoman prefs. The house still has the JPEG; it does not become a second photo library.
-
-Do not close: indexer, vault, cull, collection logic. Those are why people self-host, and they are not a secret (the models are public). Do not upload embeddings or originals “so we can index in the cloud.”
-
-Self-hosters who refuse the cloud can still organize. They cannot use your share links, Ask AI, or place lookup unless they plug in their own keys/APIs (optional OSS fallback) or run a clone of Fotomob you do not ship.
-
-### What else to add on hosted Fotomob (keep IP)
+### What else to add on a hosted Fotomob
 
 Default Fotomob stays a **relay + QR**. Extra hosted features that justify a DB without becoming a photo cloud:
 

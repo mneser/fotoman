@@ -1,6 +1,10 @@
 # Fotoman
 
-Local photo search and library UI (FastAPI). Reclaimer lives in `reclaimer/` — see [reclaimer/README.md](reclaimer/README.md).
+Local-first photo library. Photos stay in the folders you already have. Fotoman indexes them in place: describe a photo to search it, then browse by person, place, and date, cull duplicate copies, and group shots into collections without moving files.
+
+Share a collection to a phone with [Fotomob](fotomob/README.md). Your computer connects outward, so the house does not need an open port, and the relay does not keep a copy of the library. [Reclaimer](reclaimer/README.md) pulls Google Photos, Facebook, and Instagram exports onto disk for that index.
+
+MIT licensed.
 
 ## Run from source (native Linux / Kubuntu)
 

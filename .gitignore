@@ -9,3 +9,6 @@ data/
 build/
 dist/
 node_modules/
+notes.txt
+.cursor/
+fotomob/deploy/
